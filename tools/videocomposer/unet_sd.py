@@ -1,43 +1,42 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import math
-from einops import rearrange
-from rotary_embedding_torch import RotaryEmbedding
-from fairscale.nn.checkpoint import checkpoint_wrapper
 from functools import partial
-from torch import einsum
-from .mha_flash import FlashAttentionBlock
-import xformers
-import xformers.ops
+from typing import Any, Optional
 
-__all__ = ['UNetSD_temporal']
+import numpy as np
+
+import mindspore as ms
+import mindspore.common.initializer as init
+from mindspore import nn, ops
+
+from .mha_flash import FlashAttentionBlock
+from .rotary_embedding import RotaryEmbedding
+
+__all__ = ["UNetSD_temporal"]
 
 USE_TEMPORAL_TRANSFORMER = True
 
 
-### load all keys started with prefix and replace them with new_prefix
+# load all keys started with prefix and replace them with new_prefix
 def load_Block(state, prefix, new_prefix=None):
     if new_prefix is None:
         new_prefix = prefix
 
     state_dict = {}
 
-    state = {key:value for key,value in state.items() if prefix in key}
+    state = {key: value for key, value in state.items() if prefix in key}
 
-    for key,value in state.items():
+    for key, value in state.items():
         new_key = key.replace(prefix, new_prefix)
         # ### 3DConv
         # if 'encoder.0.weight' in key or 'shortcut.weight' in key or 'layer1.2.weight' in key or 'layer2.3.weight' in key or 'head.2.weight' in key:
         #     state_dict[new_key]=value.unsqueeze(2)
         # else:
-        state_dict[new_key]=value       
+        state_dict[new_key] = value
 
     return state_dict
 
 
-def load_2d_pretrained_state_dict(state,cfg):
-
+def load_2d_pretrained_state_dict(state, cfg):
     new_state_dict = {}
 
     dim = cfg.unet_dim
@@ -46,24 +45,24 @@ def load_2d_pretrained_state_dict(state,cfg):
     temporal_conv = cfg.temporal_conv
     dim_mult = cfg.unet_dim_mult
     attn_scales = cfg.unet_attn_scales
-    
+
     # params
     enc_dims = [dim * u for u in [1] + dim_mult]
     dec_dims = [dim * u for u in [dim_mult[-1]] + dim_mult[::-1]]
     shortcut_dims = []
     scale = 1.0
 
-    #embeddings
-    state_dict = load_Block(state,prefix=f'time_embedding')
+    # embeddings
+    state_dict = load_Block(state, prefix=f"time_embedding")
     new_state_dict.update(state_dict)
-    state_dict = load_Block(state,prefix=f'y_embedding')
+    state_dict = load_Block(state, prefix=f"y_embedding")
     new_state_dict.update(state_dict)
-    state_dict = load_Block(state,prefix=f'context_embedding')
+    state_dict = load_Block(state, prefix=f"context_embedding")
     new_state_dict.update(state_dict)
 
     encoder_idx = 0
-    ### init block
-    state_dict = load_Block(state,prefix=f'encoder.{encoder_idx}',new_prefix=f'encoder.{encoder_idx}.0')
+    # init block
+    state_dict = load_Block(state, prefix=f"encoder.{encoder_idx}", new_prefix=f"encoder.{encoder_idx}.0")
     new_state_dict.update(state_dict)
     encoder_idx += 1
 
@@ -74,14 +73,18 @@ def load_2d_pretrained_state_dict(state,cfg):
             idx = 0
             idx_ = 0
             # residual (+attention) blocks
-            state_dict = load_Block(state,prefix=f'encoder.{encoder_idx}.{idx}',new_prefix=f'encoder.{encoder_idx}.{idx_}')
+            state_dict = load_Block(
+                state, prefix=f"encoder.{encoder_idx}.{idx}", new_prefix=f"encoder.{encoder_idx}.{idx_}"
+            )
             new_state_dict.update(state_dict)
             idx += 1
             idx_ = 2
 
             if scale in attn_scales:
                 # block.append(AttentionBlock(out_dim, context_dim, num_heads, head_dim))
-                state_dict = load_Block(state,prefix=f'encoder.{encoder_idx}.{idx}',new_prefix=f'encoder.{encoder_idx}.{idx_}')
+                state_dict = load_Block(
+                    state, prefix=f"encoder.{encoder_idx}.{idx}", new_prefix=f"encoder.{encoder_idx}.{idx_}"
+                )
                 new_state_dict.update(state_dict)
                 # if temporal_attention:
                 #     block.append(TemporalAttentionBlock(out_dim, num_heads, head_dim, rotary_emb = self.rotary_emb))
@@ -92,22 +95,21 @@ def load_2d_pretrained_state_dict(state,cfg):
             # downsample
             if i != len(dim_mult) - 1 and j == num_res_blocks - 1:
                 # downsample = ResidualBlock(out_dim, embed_dim, out_dim, use_scale_shift_norm, 0.5, dropout)
-                state_dict = load_Block(state,prefix=f'encoder.{encoder_idx}',new_prefix=f'encoder.{encoder_idx}.0')
+                state_dict = load_Block(state, prefix=f"encoder.{encoder_idx}", new_prefix=f"encoder.{encoder_idx}.0")
                 new_state_dict.update(state_dict)
 
                 shortcut_dims.append(out_dim)
                 scale /= 2.0
                 encoder_idx += 1
 
-
     # middle
     middle_idx = 0
-    
-    state_dict = load_Block(state,prefix=f'middle.{middle_idx}')
+
+    state_dict = load_Block(state, prefix=f"middle.{middle_idx}")
     new_state_dict.update(state_dict)
     middle_idx += 2
 
-    state_dict = load_Block(state,prefix=f'middle.1',new_prefix=f'middle.{middle_idx}')
+    state_dict = load_Block(state, prefix=f"middle.1", new_prefix=f"middle.{middle_idx}")
     new_state_dict.update(state_dict)
     middle_idx += 1
 
@@ -115,11 +117,9 @@ def load_2d_pretrained_state_dict(state,cfg):
         # self.middle.append(TemporalAttentionBlock(out_dim, num_heads, head_dim, rotary_emb =  self.rotary_emb))
         middle_idx += 1
 
-    # 
-    state_dict = load_Block(state,prefix=f'middle.2',new_prefix=f'middle.{middle_idx}')
+    state_dict = load_Block(state, prefix=f"middle.2", new_prefix=f"middle.{middle_idx}")
     new_state_dict.update(state_dict)
     middle_idx += 2
-
 
     decoder_idx = 0
     for i, (in_dim, out_dim) in enumerate(zip(dec_dims[:-1], dec_dims[1:])):
@@ -127,28 +127,31 @@ def load_2d_pretrained_state_dict(state,cfg):
             idx = 0
             idx_ = 0
             # residual (+attention) blocks
-            # 
-            state_dict = load_Block(state,prefix=f'decoder.{decoder_idx}.{idx}',new_prefix=f'decoder.{decoder_idx}.{idx_}')
+            state_dict = load_Block(
+                state, prefix=f"decoder.{decoder_idx}.{idx}", new_prefix=f"decoder.{decoder_idx}.{idx_}"
+            )
             new_state_dict.update(state_dict)
             idx += 1
             idx_ += 2
             if scale in attn_scales:
                 # block.append(AttentionBlock(out_dim, context_dim, num_heads, head_dim))
-                state_dict = load_Block(state,prefix=f'decoder.{decoder_idx}.{idx}',new_prefix=f'decoder.{decoder_idx}.{idx_}')
+                state_dict = load_Block(
+                    state, prefix=f"decoder.{decoder_idx}.{idx}", new_prefix=f"decoder.{decoder_idx}.{idx_}"
+                )
                 new_state_dict.update(state_dict)
                 idx += 1
                 idx_ += 1
                 for _ in range(cfg.temporal_attn_times):
-                #     
-                    idx_ +=1
+                    idx_ += 1
 
             in_dim = out_dim
 
             # upsample
             if i != len(dim_mult) - 1 and j == num_res_blocks:
-
                 # upsample = ResidualBlock(out_dim, embed_dim, out_dim, use_scale_shift_norm, 2.0, dropout)
-                state_dict = load_Block(state,prefix=f'decoder.{decoder_idx}.{idx}',new_prefix=f'decoder.{decoder_idx}.{idx_}')
+                state_dict = load_Block(
+                    state, prefix=f"decoder.{decoder_idx}.{idx}", new_prefix=f"decoder.{decoder_idx}.{idx_}"
+                )
                 new_state_dict.update(state_dict)
                 idx += 1
                 idx_ += 2
@@ -158,10 +161,11 @@ def load_2d_pretrained_state_dict(state,cfg):
             # self.decoder.append(block)
             decoder_idx += 1
 
-    state_dict = load_Block(state,prefix=f'head')
+    state_dict = load_Block(state, prefix=f"head")
     new_state_dict.update(state_dict)
 
     return new_state_dict
+
 
 def sinusoidal_embedding(timesteps, dim):
     # check input
@@ -169,55 +173,58 @@ def sinusoidal_embedding(timesteps, dim):
     timesteps = timesteps.float()
 
     # compute sinusoidal embedding
-    sinusoid = torch.outer(
-        timesteps,
-        torch.pow(10000, -torch.arange(half).to(timesteps).div(half)))
-    x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
+    sinusoid = ops.outer(timesteps, ops.pow(10000, -ops.arange(half).to(timesteps.dtype).div(half)))
+    x = ops.cat([ops.cos(sinusoid), ops.sin(sinusoid)], axis=1)
     if dim % 2 != 0:
-        x = torch.cat([x, torch.zeros_like(x[:, :1])], dim=1)
+        x = ops.cat([x, ops.zeros_like(x[:, :1])], axis=1)
     return x
+
 
 def exists(x):
     return x is not None
+
 
 def default(val, d):
     if exists(val):
         return val
     return d() if callable(d) else d
 
-def prob_mask_like(shape, prob, device):
+
+def prob_mask_like(shape, prob):
     if prob == 1:
-        return torch.ones(shape, device = device, dtype = torch.bool)
+        return ops.ones(shape, dtype=ms.bool_)
     elif prob == 0:
-        return torch.zeros(shape, device = device, dtype = torch.bool)
+        return ops.zeros(shape, dtype=ms.bool_)
     else:
-        mask = torch.zeros(shape, device = device).float().uniform_(0, 1) < prob
-        ### aviod mask all, which will cause find_unused_parameters error
+        mask = ops.uniform(shape, ms.Tensor(0), ms.Tensor(1), dtype=ms.float32) < prob
+        # avoid mask all, which will cause find_unused_parameters error
         if mask.all():
-            mask[0]=False
+            mask[0] = False
         return mask
 
 
-class MemoryEfficientCrossAttention(nn.Module):
+class MemoryEfficientCrossAttention(nn.Cell):
     # https://github.com/MatthieuTPHR/diffusers/blob/d80b531ff8060ec1ea982b65a1b8df70f73aa67c/src/diffusers/models/attention.py#L223
     def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.0):
         super().__init__()
-        print(f"Setting up {self.__class__.__name__}. Query dim is {query_dim}, context_dim is {context_dim} and using "
-              f"{heads} heads.")
+        print(
+            f"Setting up {self.__class__.__name__}. Query dim is {query_dim}, context_dim is {context_dim} and using "
+            f"{heads} heads."
+        )
         inner_dim = dim_head * heads
         context_dim = default(context_dim, query_dim)
 
         self.heads = heads
         self.dim_head = dim_head
 
-        self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
-        self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
-        self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
+        self.to_q = nn.Dense(query_dim, inner_dim, has_bias=False)
+        self.to_k = nn.Dense(context_dim, inner_dim, has_bias=False)
+        self.to_v = nn.Dense(context_dim, inner_dim, has_bias=False)
 
-        self.to_out = nn.Sequential(nn.Linear(inner_dim, query_dim), nn.Dropout(dropout))
+        self.to_out = nn.SequentialCell([nn.Dense(inner_dim, query_dim, has_bias=True), nn.Dropout(p=dropout)])
         self.attention_op: Optional[Any] = None
 
-    def forward(self, x, context=None, mask=None):
+    def construct(self, x, context=None, mask=None):
         q = self.to_q(x)
         context = default(context, x)
         k = self.to_k(context)
@@ -228,8 +235,7 @@ class MemoryEfficientCrossAttention(nn.Module):
             lambda t: t.unsqueeze(3)
             .reshape(b, t.shape[1], self.heads, self.dim_head)
             .permute(0, 2, 1, 3)
-            .reshape(b * self.heads, t.shape[1], self.dim_head)
-            .contiguous(),
+            .reshape(b * self.heads, t.shape[1], self.dim_head),
             (q, k, v),
         )
 
@@ -246,47 +252,47 @@ class MemoryEfficientCrossAttention(nn.Module):
         )
         return self.to_out(out)
 
-class RelativePositionBias(nn.Module):
-    def __init__(
-        self,
-        heads = 8,
-        num_buckets = 32,
-        max_distance = 128
-    ):
+
+class RelativePositionBias(nn.Cell):
+    def __init__(self, heads=8, num_buckets=32, max_distance=128):
         super().__init__()
         self.num_buckets = num_buckets
         self.max_distance = max_distance
         self.relative_attention_bias = nn.Embedding(num_buckets, heads)
 
     @staticmethod
-    def _relative_position_bucket(relative_position, num_buckets = 32, max_distance = 128):
+    def _relative_position_bucket(relative_position, num_buckets=32, max_distance=128):
         ret = 0
         n = -relative_position
 
         num_buckets //= 2
         ret += (n < 0).long() * num_buckets
-        n = torch.abs(n)
+        n = ops.abs(n)
 
         max_exact = num_buckets // 2
         is_small = n < max_exact
 
-        val_if_large = max_exact + (
-            torch.log(n.float() / max_exact) / math.log(max_distance / max_exact) * (num_buckets - max_exact)
-        ).long()
-        val_if_large = torch.min(val_if_large, torch.full_like(val_if_large, num_buckets - 1))
+        val_if_large = (
+            max_exact
+            + (ops.log(n.float() / max_exact) / math.log(max_distance / max_exact) * (num_buckets - max_exact)).long()
+        )  # todo: cast to int64 may cause precision loss, we may have to use numpy to replace ops.log
+        val_if_large = ops.minimum(val_if_large, ops.full_like(val_if_large, num_buckets - 1))
 
-        ret += torch.where(is_small, n, val_if_large)
+        ret += ops.where(is_small, n, val_if_large)
         return ret
 
-    def forward(self, n, device):
-        q_pos = torch.arange(n, dtype = torch.long, device = device)
-        k_pos = torch.arange(n, dtype = torch.long, device = device)
-        rel_pos = rearrange(k_pos, 'j -> 1 j') - rearrange(q_pos, 'i -> i 1')
-        rp_bucket = self._relative_position_bucket(rel_pos, num_buckets = self.num_buckets, max_distance = self.max_distance)
+    def construct(self, n):
+        q_pos = ops.arange(n, dtype=ms.int64)
+        k_pos = ops.arange(n, dtype=ms.int64)
+        rel_pos = ops.expand_dims(k_pos, 0) - ops.expand_dims(q_pos, -1)
+        rp_bucket = self._relative_position_bucket(
+            rel_pos, num_buckets=self.num_buckets, max_distance=self.max_distance
+        )
         values = self.relative_attention_bias(rp_bucket)
-        return rearrange(values, 'i j h -> h i j')
+        return ops.transpose(values, (2, 0, 1))
 
-class SpatialTransformer(nn.Module):
+
+class SpatialTransformer(nn.Cell):
     """
     Transformer block for image-like data.
     First, project the input (aka embedding)
@@ -295,41 +301,53 @@ class SpatialTransformer(nn.Module):
     Finally, reshape to image
     NEW: use_linear for more efficiency instead of the 1x1 convs
     """
-    def __init__(self, in_channels, n_heads, d_head,
-                 depth=1, dropout=0., context_dim=None,
-                 disable_self_attn=False, use_linear=False,
-                 use_checkpoint=True):
+
+    def __init__(
+        self,
+        in_channels,
+        n_heads,
+        d_head,
+        depth=1,
+        dropout=0.0,
+        context_dim=None,
+        disable_self_attn=False,
+        use_linear=False,
+        use_checkpoint=True,
+    ):
         super().__init__()
         if exists(context_dim) and not isinstance(context_dim, list):
             context_dim = [context_dim]
         self.in_channels = in_channels
         inner_dim = n_heads * d_head
-        self.norm = torch.nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
+        self.norm = nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
         if not use_linear:
-            self.proj_in = nn.Conv2d(in_channels,
-                                     inner_dim,
-                                     kernel_size=1,
-                                     stride=1,
-                                     padding=0)
+            self.proj_in = nn.Conv2d(in_channels, inner_dim, kernel_size=1, stride=1, padding=0, has_bias=True)
         else:
-            self.proj_in = nn.Linear(in_channels, inner_dim)
+            self.proj_in = nn.Dense(in_channels, inner_dim)
 
-        self.transformer_blocks = nn.ModuleList(
-            [BasicTransformerBlock(inner_dim, n_heads, d_head, dropout=dropout, context_dim=context_dim[d],
-                                   disable_self_attn=disable_self_attn, checkpoint=use_checkpoint)
-                for d in range(depth)]
+        self.transformer_blocks = nn.CellList(
+            [
+                BasicTransformerBlock(
+                    inner_dim,
+                    n_heads,
+                    d_head,
+                    dropout=dropout,
+                    context_dim=context_dim[d],
+                    disable_self_attn=disable_self_attn,
+                    checkpoint=use_checkpoint,
+                )
+                for d in range(depth)
+            ]
         )
         if not use_linear:
-            self.proj_out = zero_module(nn.Conv2d(inner_dim,
-                                                  in_channels,
-                                                  kernel_size=1,
-                                                  stride=1,
-                                                  padding=0))
+            self.proj_out = zero_module(
+                nn.Conv2d(inner_dim, in_channels, kernel_size=1, stride=1, padding=0, has_bias=True)
+            )
         else:
-            self.proj_out = zero_module(nn.Linear(in_channels, inner_dim))
+            self.proj_out = zero_module(nn.Dense(in_channels, inner_dim))
         self.use_linear = use_linear
 
-    def forward(self, x, context=None):
+    def construct(self, x, context=None):
         # note: if no context is given, cross-attention defaults to self-attention
         if not isinstance(context, list):
             context = [context]
@@ -338,40 +356,44 @@ class SpatialTransformer(nn.Module):
         x = self.norm(x)
         if not self.use_linear:
             x = self.proj_in(x)
-        x = rearrange(x, 'b c h w -> b (h w) c').contiguous()
+        # b c h w -> b h w c -> b (h w) c
+        x = ops.transpose(x, (0, 2, 3, 1))
+        x = ops.reshape(x, (x.shape[0], -1, x.shape[3]))
         if self.use_linear:
             x = self.proj_in(x)
         for i, block in enumerate(self.transformer_blocks):
             x = block(x, context=context[i])
         if self.use_linear:
             x = self.proj_out(x)
-        x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w).contiguous()
+        # b (h w) c -> b c (h w) -> b c h w
+        x = ops.transpose(x, (0, 2, 1))
+        x = ops.reshape(x, (*x.shape[:2], h, w))
         if not self.use_linear:
             x = self.proj_out(x)
         return x + x_in
 
+
 import os
+
 _ATTN_PRECISION = os.environ.get("ATTN_PRECISION", "fp32")
 
-class CrossAttention(nn.Module):
-    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.):
+
+class CrossAttention(nn.Cell):
+    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.0):
         super().__init__()
         inner_dim = dim_head * heads
         context_dim = default(context_dim, query_dim)
 
-        self.scale = dim_head ** -0.5
+        self.scale = dim_head**-0.5
         self.heads = heads
 
-        self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
-        self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
-        self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
+        self.to_q = nn.Dense(query_dim, inner_dim, has_bias=False)
+        self.to_k = nn.Dense(context_dim, inner_dim, has_bias=False)
+        self.to_v = nn.Dense(context_dim, inner_dim, has_bias=False)
 
-        self.to_out = nn.Sequential(
-            nn.Linear(inner_dim, query_dim),
-            nn.Dropout(dropout)
-        )
+        self.to_out = nn.SequentialCell([nn.Dense(inner_dim, query_dim, has_bias=True), nn.Dropout(p=dropout)])
 
-    def forward(self, x, context=None, mask=None):
+    def construct(self, x, context=None, mask=None):
         h = self.heads
 
         q = self.to_q(x)
@@ -379,49 +401,71 @@ class CrossAttention(nn.Module):
         k = self.to_k(context)
         v = self.to_v(context)
 
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+        def rearrange_qkv(tensor):
+            # b n (h d) -> b n h d -> b h n d -> (b h) n d
+            tensor = ops.reshape(tensor, (*tensor.shape[:2], h, tensor.shape[2] // h))
+            tensor = ops.transpose(tensor, (0, 2, 1, 3))
+            tensor = ops.reshape(tensor, (-1, *tensor.shape[2:]))
+            return tensor
+
+        q, k, v = map(lambda t: rearrange_qkv(t), (q, k, v))
 
         # force cast to fp32 to avoid overflowing
-        if _ATTN_PRECISION =="fp32":
-            with torch.autocast(enabled=False, device_type = 'cuda'):
-                q, k = q.float(), k.float()
-                sim = torch.einsum('b i d, b j d -> b i j', q, k) * self.scale
-        else:
-            sim = torch.einsum('b i d, b j d -> b i j', q, k) * self.scale
-        
-        del q, k
-    
+        if _ATTN_PRECISION == "fp32":
+            q, k = q.float(), k.float()
+        sim = ops.bmm(q, ops.transpose(k, (0, 2, 1))) * self.scale
+
         if exists(mask):
-            mask = rearrange(mask, 'b ... -> b (...)')
-            max_neg_value = -torch.finfo(sim.dtype).max
-            mask = repeat(mask, 'b j -> (b h) () j', h=h)
+            b = mask.shape[0]
+            mask = ops.reshape(mask, (b, -1))
+            max_neg_value = -np.finfo(ms.dtype_to_nptype(sim.dtype)).max
+            mask = ops.expand_dims(ops.tile(mask, (h, 1)), axis=1)
             sim.masked_fill_(~mask, max_neg_value)
 
         # attention, what we cannot get enough of
         sim = sim.softmax(dim=-1)
 
-        out = torch.einsum('b i j, b j d -> b i d', sim, v)
-        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+        out = ops.bmm(sim, v)
+        # (b h) n d -> b h n d -> b n h d -> b n (h d)
+        out = ops.reshape(out, (out.shape[0] // h, h, *out.shape[1:]))
+        out = ops.transpose(out, (0, 2, 1, 3))
+        out = ops.reshape(out, (*out.shape[:2], -1))
         return self.to_out(out)
 
-class BasicTransformerBlock(nn.Module):
+
+class BasicTransformerBlock(nn.Cell):
     # ATTENTION_MODES = {
     #     "softmax": CrossAttention,  # vanilla attention
     #     "softmax-xformers": MemoryEfficientCrossAttention
     # }
-    def __init__(self, dim, n_heads, d_head, dropout=0., context_dim=None, gated_ff=True, checkpoint=True,
-                 disable_self_attn=False):
+    def __init__(
+        self,
+        dim,
+        n_heads,
+        d_head,
+        dropout=0.0,
+        context_dim=None,
+        gated_ff=True,
+        checkpoint=True,
+        disable_self_attn=False,
+    ):
         super().__init__()
         # attn_mode = "softmax-xformers" if XFORMERS_IS_AVAILBLE else "softmax"
         # assert attn_mode in self.ATTENTION_MODES
         # attn_cls = CrossAttention
         attn_cls = MemoryEfficientCrossAttention
         self.disable_self_attn = disable_self_attn
-        self.attn1 = attn_cls(query_dim=dim, heads=n_heads, dim_head=d_head, dropout=dropout,
-                              context_dim=context_dim if self.disable_self_attn else None)  # is a self-attention if not self.disable_self_attn
+        self.attn1 = attn_cls(
+            query_dim=dim,
+            heads=n_heads,
+            dim_head=d_head,
+            dropout=dropout,
+            context_dim=context_dim if self.disable_self_attn else None,
+        )  # is a self-attention if not self.disable_self_attn
         self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff)
-        self.attn2 = attn_cls(query_dim=dim, context_dim=context_dim,
-                              heads=n_heads, dim_head=d_head, dropout=dropout)  # is self-attn if context is none
+        self.attn2 = attn_cls(
+            query_dim=dim, context_dim=context_dim, heads=n_heads, dim_head=d_head, dropout=dropout
+        )  # is self-attn if context is none
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
         self.norm3 = nn.LayerNorm(dim)
@@ -430,50 +474,80 @@ class BasicTransformerBlock(nn.Module):
     def forward_(self, x, context=None):
         return checkpoint(self._forward, (x, context), self.parameters(), self.checkpoint)
 
-    def forward(self, x, context=None):
+    def construct(self, x, context=None):
         x = self.attn1(self.norm1(x), context=context if self.disable_self_attn else None) + x
         x = self.attn2(self.norm2(x), context=context) + x
         x = self.ff(self.norm3(x)) + x
         return x
 
+
 # feedforward
-class GEGLU(nn.Module):
+class GEGLU(nn.Cell):
     def __init__(self, dim_in, dim_out):
         super().__init__()
-        self.proj = nn.Linear(dim_in, dim_out * 2)
+        self.proj = nn.Dense(dim_in, dim_out * 2)
 
-    def forward(self, x):
-        x, gate = self.proj(x).chunk(2, dim=-1)
-        return x * F.gelu(gate)
+    def construct(self, x):
+        x, gate = self.proj(x).chunk(2, axis=-1)
+        return x * ops.gelu(gate)
+
+
+def conv_nd(dims, *args, **kwargs):
+    """
+    Create a 1D, 2D, or 3D convolution module.
+    """
+    if dims == 1:
+        return nn.Conv1d(*args, **kwargs)
+    elif dims == 2:
+        return nn.Conv2d(*args, **kwargs)
+    elif dims == 3:
+        return nn.Conv3d(*args, **kwargs)
+    raise ValueError(f"unsupported dimensions: {dims}")
+
+
+def linear(*args, **kwargs):
+    """
+    Create a linear module.
+    """
+    return nn.Dense(*args, **kwargs)
+
+
+def avg_pool_nd(dims, *args, **kwargs):
+    """
+    Create a 1D, 2D, or 3D average pooling module.
+    """
+    if dims == 1:
+        return nn.AvgPool1d(*args, **kwargs)
+    elif dims == 2:
+        return nn.AvgPool2d(*args, **kwargs)
+    elif dims == 3:
+        return nn.AvgPool3d(*args, **kwargs)
+    raise ValueError(f"unsupported dimensions: {dims}")
+
 
 def zero_module(module):
     """
     Zero out the parameters of a module and return it.
     """
-    for p in module.parameters():
-        p.detach().zero_()
+    for p in module.get_parameters():
+        p.set_data(init.initializer("zeros", p.shape, p.dtype))
     return module
 
-class FeedForward(nn.Module):
-    def __init__(self, dim, dim_out=None, mult=4, glu=False, dropout=0.):
+
+class FeedForward(nn.Cell):
+    def __init__(self, dim, dim_out=None, mult=4, glu=False, dropout=0.0):
         super().__init__()
         inner_dim = int(dim * mult)
         dim_out = default(dim_out, dim)
-        project_in = nn.Sequential(
-            nn.Linear(dim, inner_dim),
-            nn.GELU()
-        ) if not glu else GEGLU(dim, inner_dim)
+        project_in = nn.SequentialCell([nn.Dense(dim, inner_dim), nn.GELU()]) if not glu else GEGLU(dim, inner_dim)
 
-        self.net = nn.Sequential(
-            project_in,
-            nn.Dropout(dropout),
-            nn.Linear(inner_dim, dim_out)
-        )
+        self.net = nn.SequentialCell([project_in, nn.Dropout(p=dropout), nn.Dense(inner_dim, dim_out)])
 
-    def forward(self, x):
+    def construct(self, x):
         return self.net(x)
 
-class Upsample(nn.Module):
+
+class Upsample(nn.Cell):
     """
     An upsampling layer with an optional convolution.
     :param channels: channels in the inputs and outputs.
@@ -489,22 +563,20 @@ class Upsample(nn.Module):
         self.use_conv = use_conv
         self.dims = dims
         if use_conv:
-            self.conv = nn.Conv2d(self.channels, self.out_channels, 3, padding=padding)
+            self.conv = nn.Conv2d(self.channels, self.out_channels, 3, pad_mode="pad", padding=padding, has_bias=True)
 
-    def forward(self, x):
+    def construct(self, x):
         assert x.shape[1] == self.channels
         if self.dims == 3:
-            x = F.interpolate(
-                x, (x.shape[2], x.shape[3] * 2, x.shape[4] * 2), mode="nearest"
-            )
+            x = ops.interpolate(x, (x.shape[2], x.shape[3] * 2, x.shape[4] * 2), mode="nearest")
         else:
-            x = F.interpolate(x, scale_factor=2, mode="nearest")
+            x = ops.interpolate(x, scale_factor=2, mode="nearest")
         if self.use_conv:
             x = self.conv(x)
         return x
 
 
-class ResBlock(nn.Module):
+class ResBlock(nn.Cell):
     """
     A residual block that can optionally change the number of channels.
     :param channels: the number of input channels.
@@ -519,6 +591,7 @@ class ResBlock(nn.Module):
     :param up: if True, use this block for upsampling.
     :param down: if True, use this block for downsampling.
     """
+
     def __init__(
         self,
         channels,
@@ -542,10 +615,10 @@ class ResBlock(nn.Module):
         self.use_scale_shift_norm = use_scale_shift_norm
         self.use_temporal_conv = use_temporal_conv
 
-        self.in_layers = nn.Sequential(
+        self.in_layers = nn.SequentialCell(
             nn.GroupNorm(32, channels),
             nn.SiLU(),
-            nn.Conv2d(channels, self.out_channels, 3, padding=1),
+            nn.Conv2d(channels, self.out_channels, 3, pad_mode="pad", padding=1, has_bias=True),
         )
 
         self.updown = up or down
@@ -559,45 +632,42 @@ class ResBlock(nn.Module):
         else:
             self.h_upd = self.x_upd = nn.Identity()
 
-        self.emb_layers = nn.Sequential(
+        self.emb_layers = nn.SequentialCell(
             nn.SiLU(),
-            nn.Linear(
+            nn.Dense(
                 emb_channels,
                 2 * self.out_channels if use_scale_shift_norm else self.out_channels,
             ),
         )
-        self.out_layers = nn.Sequential(
+        self.out_layers = nn.SequentialCell(
             nn.GroupNorm(32, self.out_channels),
             nn.SiLU(),
             nn.Dropout(p=dropout),
-            zero_module(
-                nn.Conv2d(self.out_channels, self.out_channels, 3, padding=1)
-            ),
+            zero_module(nn.Conv2d(self.out_channels, self.out_channels, 3, pad_mode="pad", padding=1, has_bias=True)),
         )
 
         if self.out_channels == channels:
             self.skip_connection = nn.Identity()
         elif use_conv:
             self.skip_connection = conv_nd(
-                dims, channels, self.out_channels, 3, padding=1
+                dims, channels, self.out_channels, 3, pad_mode="pad", padding=1, has_bias=True
             )
         else:
-            self.skip_connection = nn.Conv2d(channels, self.out_channels, 1)
+            self.skip_connection = nn.Conv2d(channels, self.out_channels, 1, has_bias=True)
 
         if self.use_temporal_conv:
-            self.temopral_conv = TemporalConvBlock_v2(self.out_channels, self.out_channels, dropout=0.1, use_image_dataset=use_image_dataset)
+            self.temopral_conv = TemporalConvBlock_v2(
+                self.out_channels, self.out_channels, dropout=0.1, use_image_dataset=use_image_dataset
+            )
             # self.temopral_conv_2 = TemporalConvBlock(self.out_channels, self.out_channels, dropout=0.1, use_image_dataset=use_image_dataset)
 
-    def forward(self, x, emb, batch_size):
+    def construct(self, x, emb, batch_size):
         """
         Apply the block to a Tensor, conditioned on a timestep embedding.
         :param x: an [N x C x ...] Tensor of features.
         :param emb: an [N x emb_channels] Tensor of timestep embeddings.
         :return: an [N x C x ...] Tensor of outputs.
         """
-        return self._forward(x, emb, batch_size)
-
-    def _forward(self, x, emb, batch_size):
         if self.updown:
             in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
             h = in_rest(x)
@@ -606,12 +676,12 @@ class ResBlock(nn.Module):
             h = in_conv(h)
         else:
             h = self.in_layers(x)
-        emb_out = self.emb_layers(emb).type(h.dtype)
+        emb_out = self.emb_layers(emb).astype(h.dtype)
         while len(emb_out.shape) < len(h.shape):
             emb_out = emb_out[..., None]
         if self.use_scale_shift_norm:
             out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
-            scale, shift = th.chunk(emb_out, 2, dim=1)
+            scale, shift = ops.chunk(emb_out, 2, axis=1)
             h = out_norm(h) * (1 + scale) + shift
             h = out_rest(h)
         else:
@@ -620,13 +690,18 @@ class ResBlock(nn.Module):
         h = self.skip_connection(x) + h
 
         if self.use_temporal_conv:
-            h = rearrange(h, '(b f) c h w -> b c f h w', b=batch_size)
+            # (b f) c h w -> b f c h w -> b c f h w
+            h = ops.reshape(h, (batch_size, h.shape[0] // batch_size, *h.shape[1:]))
+            h = ops.transpose(h, (0, 2, 1, 3, 4))
             h = self.temopral_conv(h)
             # h = self.temopral_conv_2(h)
-            h = rearrange(h, 'b c f h w -> (b f) c h w')
+            # 'b c f h w -> b f c h w -> (b f) c h w
+            h = ops.transpose(h, (0, 2, 1, 3, 4))
+            h = ops.reshape(h, (-1, *h.shape[2:]))
         return h
 
-class Downsample(nn.Module):
+
+class Downsample(nn.Cell):
     """
     A downsampling layer with an optional convolution.
     :param channels: channels in the inputs and outputs.
@@ -635,7 +710,7 @@ class Downsample(nn.Module):
                  downsampling occurs in the inner-two dimensions.
     """
 
-    def __init__(self, channels, use_conv, dims=2, out_channels=None,padding=1):
+    def __init__(self, channels, use_conv, dims=2, out_channels=None, padding=1):
         super().__init__()
         self.channels = channels
         self.out_channels = out_channels or channels
@@ -643,36 +718,37 @@ class Downsample(nn.Module):
         self.dims = dims
         stride = 2 if dims != 3 else (1, 2, 2)
         if use_conv:
-            self.op = nn.Conv2d(self.channels, self.out_channels, 3, stride=stride, padding=padding)
+            self.op = nn.Conv2d(
+                self.channels, self.out_channels, 3, stride=stride, pad_mode="pad", padding=padding, has_bias=True
+            )
         else:
             assert self.channels == self.out_channels
             self.op = avg_pool_nd(dims, kernel_size=stride, stride=stride)
 
-    def forward(self, x):
+    def construct(self, x):
         assert x.shape[1] == self.channels
         return self.op(x)
 
-class Resample(nn.Module):
 
+class Resample(nn.Cell):
     def __init__(self, in_dim, out_dim, mode):
-        assert mode in ['none', 'upsample', 'downsample']
+        assert mode in ["none", "upsample", "downsample"]
         super(Resample, self).__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.mode = mode
-    
-    def forward(self, x, reference=None):
-        if self.mode == 'upsample':
+
+    def construct(self, x, reference=None):
+        if self.mode == "upsample":
             assert reference is not None
-            x = F.interpolate(x, size=reference.shape[-2:], mode='nearest')
-        elif self.mode == 'downsample':
-            x = F.adaptive_avg_pool2d(x, output_size=tuple(u // 2 for u in x.shape[-2:]))
+            x = ops.interpolate(x, size=reference.shape[-2:], mode="nearest")
+        elif self.mode == "downsample":
+            x = ops.adaptive_avg_pool2d(x, output_size=tuple(u // 2 for u in x.shape[-2:]))
         return x
 
-class ResidualBlock(nn.Module):
 
-    def __init__(self, in_dim, embed_dim, out_dim, use_scale_shift_norm=True,
-                 mode='none', dropout=0.0):
+class ResidualBlock(nn.Cell):
+    def __init__(self, in_dim, embed_dim, out_dim, use_scale_shift_norm=True, mode="none", dropout=0.0):
         super(ResidualBlock, self).__init__()
         self.in_dim = in_dim
         self.embed_dim = embed_dim
@@ -681,30 +757,32 @@ class ResidualBlock(nn.Module):
         self.mode = mode
 
         # layers
-        self.layer1 = nn.Sequential(
-            nn.GroupNorm(32, in_dim),
-            nn.SiLU(),
-            nn.Conv2d(in_dim, out_dim, 3, padding=1))
+        self.layer1 = nn.SequentialCell(
+            nn.GroupNorm(32, in_dim), nn.SiLU(), nn.Conv2d(in_dim, out_dim, 3, pad_mode="pad", padding=1, has_bias=True)
+        )
         self.resample = Resample(in_dim, in_dim, mode)
-        self.embedding = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(embed_dim, out_dim * 2 if use_scale_shift_norm else out_dim))
-        self.layer2 = nn.Sequential(
+        self.embedding = nn.SequentialCell(
+            nn.SiLU(), nn.Dense(embed_dim, out_dim * 2 if use_scale_shift_norm else out_dim)
+        )
+        self.layer2 = nn.SequentialCell(
             nn.GroupNorm(32, out_dim),
             nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Conv2d(out_dim, out_dim, 3, padding=1))
-        self.shortcut = nn.Identity() if in_dim == out_dim else nn.Conv2d(in_dim, out_dim, 1)
+            nn.Dropout(p=dropout),
+            nn.Conv2d(out_dim, out_dim, 3, pad_mode="pad", padding=1, has_bias=True),
+        )
+        self.shortcut = nn.Identity() if in_dim == out_dim else nn.Conv2d(in_dim, out_dim, 1, has_bias=True)
 
         # zero out the last layer params
-        nn.init.zeros_(self.layer2[-1].weight)
-    
-    def forward(self, x, e, reference=None):
+        self.layer2[-1].weight.set_data(
+            init.initializer("zeros", self.layer2[-1].weight.shape, self.layer2[-1].weight.dtype)
+        )
+
+    def construct(self, x, e, reference=None):
         identity = self.resample(x, reference)
         x = self.layer1[-1](self.resample(self.layer1[:-1](x), reference))
-        e = self.embedding(e).unsqueeze(-1).unsqueeze(-1).type(x.dtype)
+        e = self.embedding(e).unsqueeze(-1).unsqueeze(-1).astype(x.dtype)
         if self.use_scale_shift_norm:
-            scale, shift = e.chunk(2, dim=1)
+            scale, shift = e.chunk(2, axis=1)
             x = self.layer2[0](x) * (1 + scale) + shift
             x = self.layer2[1:](x)
         else:
@@ -713,8 +791,8 @@ class ResidualBlock(nn.Module):
         x = x + self.shortcut(identity)
         return x
 
-class AttentionBlock(nn.Module):
 
+class AttentionBlock(nn.Cell):
     def __init__(self, dim, context_dim=None, num_heads=None, head_dim=None):
         # consider head_dim first, then num_heads
         num_heads = dim // head_dim if head_dim else num_heads
@@ -729,35 +807,36 @@ class AttentionBlock(nn.Module):
 
         # layers
         self.norm = nn.GroupNorm(32, dim)
-        self.to_qkv = nn.Conv2d(dim, dim * 3, 1)
+        self.to_qkv = nn.Conv2d(dim, dim * 3, 1, has_bias=True)
         if context_dim is not None:
-            self.context_kv = nn.Linear(context_dim, dim * 2)
-        self.proj = nn.Conv2d(dim, dim, 1)
+            self.context_kv = nn.Dense(context_dim, dim * 2)
+        self.proj = nn.Conv2d(dim, dim, 1, has_bias=True)
 
         # zero out the last layer params
-        nn.init.zeros_(self.proj.weight)
-    
-    def forward(self, x, context=None):
+        self.proj.weight.set_data(init.initializer("zeros", self.proj.weight.shape, self.proj.weight.dtype))
+
+    def construct(self, x, context=None):
         r"""x:       [B, C, H, W].
-            context: [B, L, C] or None.
+        context: [B, L, C] or None.
         """
         identity = x
-        b, c, h, w, n, d = *x.size(), self.num_heads, self.head_dim
+        b, c, h, w, n, d = *x.shape, self.num_heads, self.head_dim
 
         # compute query, key, value
         x = self.norm(x)
-        q, k, v = self.to_qkv(x).view(b, n * 3, d, h * w).chunk(3, dim=1)
+        q, k, v = self.to_qkv(x).view(b, n * 3, d, h * w).chunk(3, axis=1)
         if context is not None:
-            ck, cv = self.context_kv(context).reshape(b, -1, n * 2, d).permute(0, 2, 3, 1).chunk(2, dim=1)
-            k = torch.cat([ck, k], dim=-1)
-            v = torch.cat([cv, v], dim=-1)
+            ck, cv = self.context_kv(context).reshape(b, -1, n * 2, d).permute(0, 2, 3, 1).chunk(2, axis=1)
+            k = ops.cat([ck, k], axis=-1)
+            v = ops.cat([cv, v], axis=-1)
 
         # compute attention
-        attn = torch.matmul(q.transpose(-1, -2) * self.scale, k * self.scale)
-        attn = F.softmax(attn, dim=-1)
+        # todo: bmm?
+        attn = ops.matmul(q.transpose((0, 1, 3, 2)) * self.scale, k * self.scale)
+        attn = ops.softmax(attn, axis=-1)
 
         # gather context
-        x = torch.matmul(v, attn.transpose(-1, -2))
+        x = ops.matmul(v, attn.transpose((0, 1, 3, 2)))
         x = x.reshape(b, c, h, w)
 
         # output
@@ -765,66 +844,60 @@ class AttentionBlock(nn.Module):
         return x + identity
 
 
-class TemporalAttentionBlock(nn.Module):
-    def __init__(
-        self,
-        dim,
-        heads = 4,
-        dim_head = 32,
-        rotary_emb = None,
-        use_image_dataset = False,
-        use_sim_mask = False
-    ):
+class TemporalAttentionBlock(nn.Cell):
+    def __init__(self, dim, heads=4, dim_head=32, rotary_emb=None, use_image_dataset=False, use_sim_mask=False):
         super().__init__()
-        # consider num_heads first, as pos_bias needs fixed num_heads 
+        # consider num_heads first, as pos_bias needs fixed num_heads
         # heads = dim // dim_head if dim_head else heads
         dim_head = dim // heads
         assert heads * dim_head == dim
         self.use_image_dataset = use_image_dataset
         self.use_sim_mask = use_sim_mask
 
-        self.scale = dim_head ** -0.5
+        self.scale = dim_head**-0.5
         self.heads = heads
         hidden_dim = dim_head * heads
 
         self.norm = nn.GroupNorm(32, dim)
         self.rotary_emb = rotary_emb
-        self.to_qkv = nn.Linear(dim, hidden_dim * 3)#, bias = False)
-        self.to_out = nn.Linear(hidden_dim, dim)#, bias = False)
+        self.to_qkv = nn.Dense(dim, hidden_dim * 3)  # , bias = False)
+        self.to_out = nn.Dense(hidden_dim, dim)  # , bias = False)
 
         # nn.init.zeros_(self.to_out.weight)
         # nn.init.zeros_(self.to_out.bias)
 
-    def forward(
-        self,
-        x,
-        pos_bias = None,
-        focus_present_mask = None,
-        video_mask = None
-    ):
-
+    def construct(self, x, pos_bias=None, focus_present_mask=None, video_mask=None):
         identity = x
-        n, height, device = x.shape[2], x.shape[-2], x.device
+        n, height = x.shape[2], x.shape[-2]
 
         x = self.norm(x)
-        x = rearrange(x, 'b c f h w -> b (h w) f c')
+        # b c f h w -> b c f (h w) -> b (h w) f c
+        x = ops.reshape(x, (*x.shape[:3], -1))
+        x = ops.transpose(x, (0, 3, 2, 1))
 
-        qkv = self.to_qkv(x).chunk(3, dim = -1)
+        qkv = self.to_qkv(x).chunk(3, axis=-1)
 
         if exists(focus_present_mask) and focus_present_mask.all():
             # if all batch samples are focusing on present
             # it would be equivalent to passing that token's values （v=qkv[-1]） through to the output
             values = qkv[-1]
             out = self.to_out(values)
-            out = rearrange(out, 'b (h w) f c -> b c f h w', h = height)
+            # b (h w) f c -> b h w f c -> b c f h w
+            out = ops.reshape(out, (out.shape[0], height, out.shape[1] // height, *out.shape[2:]))
+            out = ops.transpose(out, (0, 4, 3, 1, 2))
 
             return out + identity
 
         # split out heads
-        q= rearrange(qkv[0], '... n (h d) -> ... h n d', h = self.heads)
-        k= rearrange(qkv[1], '... n (h d) -> ... h n d', h = self.heads)
-        v= rearrange(qkv[2], '... n (h d) -> ... h n d', h = self.heads)
-
+        # ... n (h d) -> ... n h d -> ... h n d
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        permute_idx = tuple(range(q.ndim - 3)) + (q.ndim - 2, q.ndim - 3, q.ndim - 1)
+        q = ops.reshape(q, (*q.shape[:-1], self.heads, q.shape[-1] // self.heads))
+        q = ops.transpose(q, permute_idx)
+        k = ops.reshape(k, (*k.shape[:-1], self.heads, k.shape[-1] // self.heads))
+        k = ops.transpose(k, permute_idx)
+        v = ops.reshape(v, (*v.shape[:-1], self.heads, v.shape[-1] // self.heads))
+        v = ops.transpose(v, permute_idx)
 
         # scale
         q = q * self.scale
@@ -836,54 +909,58 @@ class TemporalAttentionBlock(nn.Module):
 
         # similarity
         # shape [b (hw) h n n], n=f
-        sim = torch.einsum('... h i d, ... h j d -> ... h i j', q, k)
+        sim = ops.bmm(q, ops.transpose(k, (0, 1, 2, 4, 3)))
 
         # relative positional bias
-
         if exists(pos_bias):
             # print(sim.shape,pos_bias.shape)
             sim = sim + pos_bias
 
-        if (focus_present_mask is None and video_mask is not None):
-            #video_mask: [B, n]
-            mask = video_mask[:, None, :] * video_mask[:, :, None] # [b,n,n]
-            mask = mask.unsqueeze(1).unsqueeze(1) #[b,1,1,n,n]
-            sim = sim.masked_fill(~mask, -torch.finfo(sim.dtype).max)
+        if focus_present_mask is None and video_mask is not None:
+            # video_mask: [B, n]
+            mask = video_mask[:, None, :] * video_mask[:, :, None]  # [b,n,n]
+            mask = mask.unsqueeze(1).unsqueeze(1)  # [b,1,1,n,n]
+            sim = sim.masked_fill(~mask, -np.finfo(ms.dtype_to_nptype(sim.dtype)).max)
         elif exists(focus_present_mask) and not (~focus_present_mask).all():
-            attend_all_mask = torch.ones((n, n), device = device, dtype = torch.bool)
-            attend_self_mask = torch.eye(n, device = device, dtype = torch.bool)
+            attend_all_mask = ops.ones((n, n), dtype=ms.bool_)
+            attend_self_mask = ops.eye(n, dtype=ms.bool_)
 
-            mask = torch.where(
-                rearrange(focus_present_mask, 'b -> b 1 1 1 1'),
-                rearrange(attend_self_mask, 'i j -> 1 1 1 i j'),
-                rearrange(attend_all_mask, 'i j -> 1 1 1 i j'),
+            mask = ops.where(
+                ops.reshape(focus_present_mask, (-1, 1, 1, 1, 1)),
+                ops.reshape(attend_self_mask, (1, 1, 1, *attend_self_mask.shape)),
+                ops.reshape(attend_all_mask, (1, 1, 1, *attend_all_mask.shape)),
             )
 
-            sim = sim.masked_fill(~mask, -torch.finfo(sim.dtype).max)
+            sim = sim.masked_fill(~mask, -np.finfo(ms.dtype_to_nptype(sim.dtype)).max)
 
         if self.use_sim_mask:
-            sim_mask = torch.tril(torch.ones((n, n), device = device, dtype = torch.bool), diagonal=0)
-            sim = sim.masked_fill(~sim_mask, -torch.finfo(sim.dtype).max)
+            sim_mask = ops.tril(ops.ones((n, n), dtype=ms.bool_), diagonal=0)
+            sim = sim.masked_fill(~sim_mask, -np.finfo(ms.dtype_to_nptype(sim.dtype)).max)
 
         # numerical stability
-        sim = sim - sim.amax(dim = -1, keepdim = True).detach()
-        attn = sim.softmax(dim = -1)
+        sim = sim - sim.amax(axis=-1, keepdims=True)
+        attn = sim.softmax(axis=-1)
 
         # aggregate values
-
-        out = torch.einsum('... h i j, ... h j d -> ... h i d', attn, v)
-        out = rearrange(out, '... h n d -> ... n (h d)')
+        out = ops.bmm(attn, v)
+        # ... h n d -> ... n h d -> ... n (h d)
+        permute_idx = tuple(range(out.ndim - 3)) + (out.ndim - 2, out.ndim - 3, out.ndim - 1)
+        out = ops.transpose(out, (0, 1, 3, 2, 4))
+        out = ops.reshape(out, (*out.shape[:-2], -1))
         out = self.to_out(out)
 
-        out = rearrange(out, 'b (h w) f c -> b c f h w', h = height)
+        # b (h w) f c -> b h w f c -> b c f h w
+        out = ops.reshape(out, (out.shape[0], height, out.shape[1] // height, *out.shape[2:]))
+        out = ops.transpose(out, (0, 4, 3, 1, 2))
 
         if self.use_image_dataset:
-            out = identity + 0*out
+            out = identity + 0 * out
         else:
             out = identity + out
         return out
 
-class TemporalTransformer(nn.Module):
+
+class TemporalTransformer(nn.Cell):
     """
     Transformer block for image-like data.
     First, project the input (aka embedding)
@@ -891,10 +968,21 @@ class TemporalTransformer(nn.Module):
     Then apply standard transformer action.
     Finally, reshape to image
     """
-    def __init__(self, in_channels, n_heads, d_head,
-                 depth=1, dropout=0., context_dim=None,
-                 disable_self_attn=False, use_linear=False,
-                 use_checkpoint=True, only_self_att=True, multiply_zero=False):
+
+    def __init__(
+        self,
+        in_channels,
+        n_heads,
+        d_head,
+        depth=1,
+        dropout=0.0,
+        context_dim=None,
+        disable_self_attn=False,
+        use_linear=False,
+        use_checkpoint=True,
+        only_self_att=True,
+        multiply_zero=False,
+    ):
         super().__init__()
         self.multiply_zero = multiply_zero
         self.only_self_att = only_self_att
@@ -905,36 +993,33 @@ class TemporalTransformer(nn.Module):
             context_dim = [context_dim]
         self.in_channels = in_channels
         inner_dim = n_heads * d_head
-        self.norm = torch.nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
+        self.norm = nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
         if not use_linear:
-            self.proj_in = nn.Conv1d(in_channels, 
-                                    inner_dim,
-                                    kernel_size=1,
-                                    stride=1,
-                                    padding=0)
+            self.proj_in = nn.Conv1d(in_channels, inner_dim, kernel_size=1, stride=1, padding=0, has_bias=True)
         else:
-            self.proj_in = nn.Linear(in_channels, inner_dim)
+            self.proj_in = nn.Dense(in_channels, inner_dim)
             if self.use_adaptor:
-                self.adaptor_in = nn.Linear(frames, frames)
+                self.adaptor_in = nn.Dense(frames, frames)  # todo: wtf frames
 
-        self.transformer_blocks = nn.ModuleList(
-            [BasicTransformerBlock(inner_dim, n_heads, d_head, dropout=dropout, context_dim=context_dim[d], 
-                checkpoint=use_checkpoint)
-                for d in range(depth)]
+        self.transformer_blocks = nn.CellList(
+            [
+                BasicTransformerBlock(
+                    inner_dim, n_heads, d_head, dropout=dropout, context_dim=context_dim[d], checkpoint=use_checkpoint
+                )
+                for d in range(depth)
+            ]
         )
         if not use_linear:
-            self.proj_out = zero_module(nn.Conv1d(inner_dim,
-                                                in_channels,
-                                                kernel_size=1,
-                                                stride=1,
-                                                padding=0))
+            self.proj_out = zero_module(
+                nn.Conv1d(inner_dim, in_channels, kernel_size=1, stride=1, padding=0, has_bias=True)
+            )
         else:
-            self.proj_out = zero_module(nn.Linear(in_channels, inner_dim))
+            self.proj_out = zero_module(nn.Dense(in_channels, inner_dim))
             if self.use_adaptor:
-                self.adaptor_out = nn.Linear(frames, frames)
+                self.adaptor_out = nn.Dense(frames, frames)  # todo: wtf frames
         self.use_linear = use_linear
 
-    def forward(self, x, context=None):
+    def construct(self, x, context=None):
         # note: if no context is given, cross-attention defaults to self-attention
         if self.only_self_att:
             context = None
@@ -945,44 +1030,61 @@ class TemporalTransformer(nn.Module):
         x = self.norm(x)
 
         if not self.use_linear:
-            x = rearrange(x, 'b c f h w -> (b h w) c f').contiguous()
+            # b c f h w -> b h w c f -> (b h w) c f
+            x = ops.transpose(x, (0, 3, 4, 1, 2))
+            x = ops.reshape(x, (-1, *x.shape[3:]))
             x = self.proj_in(x)
         # [16384, 16, 320]
         if self.use_linear:
-            x = rearrange(x, '(b f) c h w -> b (h w) f c', f=self.frames).contiguous()
+            # (b f) c h w -> b f c h w -> b h w f c -> b (h w) f c
+            x = ops.reshape(x, (x.shape[0] // self.frames, self.frames, *x.shape[1:]))
+            x = ops.transpose(x, (0, 3, 4, 1, 2))
+            x = ops.reshape(x, (x.shape[0], -1, *x.shape[3:]))  # todo: wtf frames
             x = self.proj_in(x)
 
         if self.only_self_att:
-            x = rearrange(x, 'bhw c f -> bhw f c').contiguous()
+            x = ops.transpose(x, (0, 2, 1))
             for i, block in enumerate(self.transformer_blocks):
                 x = block(x)
-            x = rearrange(x, '(b hw) f c -> b hw f c', b=b).contiguous()
+            # (b hw) f c -> b hw f c
+            x = ops.reshape(x, (b, x.shape[0] // b, *x.shape[1:]))
         else:
-            x = rearrange(x, '(b hw) c f -> b hw f c', b=b).contiguous()
+            # (b hw) c f -> b hw f c
+            x = ops.reshape(x, (b, x.shape[0] // b, *x.shape[1:]))
+            x = ops.transpose(x, (0, 1, 3, 2))
             for i, block in enumerate(self.transformer_blocks):
                 # context[i] = repeat(context[i], '(b f) l con -> b (f r) l con', r=(h*w)//self.frames, f=self.frames).contiguous()
-                context[i] = rearrange(context[i], '(b f) l con -> b f l con', f=self.frames).contiguous()
+                # (b f) l con -> b f l con
+                context[i] = ops.reshape(
+                    context[i], (context[i].shape[0] // self.frames, self.frames, *context[i].shape[1:])
+                )  # todo: wtf frames
                 # calculate each batch one by one (since number in shape could not greater then 65,535 for some package)
                 for j in range(b):
-                    context_i_j = repeat(context[i][j], 'f l con -> (f r) l con', r=(h*w)//self.frames, f=self.frames).contiguous()
+                    context_i_j = ops.tile(context[i][j], ((h * w) // self.frames, 1, 1))  # todo: wtf frames
                     x[j] = block(x[j], context=context_i_j)
-        
+
         if self.use_linear:
             x = self.proj_out(x)
-            x = rearrange(x, 'b (h w) f c -> b f c h w', h=h, w=w).contiguous()
+            # b (h w) f c -> b h w f c -> b f c h w
+            x = ops.reshape(x, (x.shape[0], h, w, x.shape[2:]))
+            x = ops.transpose(x, (0, 3, 4, 1, 2))
         if not self.use_linear:
-            # x = rearrange(x, 'bhw f c -> bhw c f').contiguous()
-            x = rearrange(x, 'b hw f c -> (b hw) c f').contiguous()
+            # b hw f c -> (b hw) f c -> (b hw) c f
+            x = ops.reshape(x, (-1, x.shape[2:]))
+            x = ops.transpose(x, (0, 2, 1))
             x = self.proj_out(x)
-            x = rearrange(x, '(b h w) c f -> b c f h w', b=b, h=h, w=w).contiguous()
-        
+            # (b h w) c f -> b h w c f -> b c f h w
+            x = ops.reshape(x, (b, h, w, *x.shape[1:]))
+            x = ops.transpose(x, (0, 3, 4, 1, 2))
+
         if self.multiply_zero:
             x = 0.0 * x + x_in
         else:
             x = x + x_in
         return x
 
-class TemporalAttentionMultiBlock(nn.Module):
+
+class TemporalAttentionMultiBlock(nn.Cell):
     def __init__(
         self,
         dim,
@@ -994,125 +1096,128 @@ class TemporalAttentionMultiBlock(nn.Module):
         temporal_attn_times=1,
     ):
         super().__init__()
-        self.att_layers = nn.ModuleList(
-                [TemporalAttentionBlock(dim, heads, dim_head, rotary_emb, use_image_dataset, use_sim_mask)
-                    for _ in range(temporal_attn_times)]
-                )
-    
-    def forward(
-        self,
-        x,
-        pos_bias = None,
-        focus_present_mask = None,
-        video_mask = None
-    ):
+        self.att_layers = nn.CellList(
+            [
+                TemporalAttentionBlock(dim, heads, dim_head, rotary_emb, use_image_dataset, use_sim_mask)
+                for _ in range(temporal_attn_times)
+            ]
+        )
+
+    def construct(self, x, pos_bias=None, focus_present_mask=None, video_mask=None):
         for layer in self.att_layers:
             x = layer(x, pos_bias, focus_present_mask, video_mask)
         return x
 
 
-class InitTemporalConvBlock(nn.Module):
-
-    def __init__(self, in_dim, out_dim=None, dropout=0.0,use_image_dataset=False):
+class InitTemporalConvBlock(nn.Cell):
+    def __init__(self, in_dim, out_dim=None, dropout=0.0, use_image_dataset=False):
         super(InitTemporalConvBlock, self).__init__()
         if out_dim is None:
-            out_dim = in_dim#int(1.5*in_dim)
+            out_dim = in_dim  # int(1.5*in_dim)
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.use_image_dataset = use_image_dataset
 
         # conv layers
-        self.conv = nn.Sequential(
+        self.conv = nn.SequentialCell(
             nn.GroupNorm(32, out_dim),
             nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Conv3d(out_dim, in_dim, (3, 1, 1), padding = (1, 0, 0)))
+            nn.Dropout(p=dropout),
+            nn.Conv3d(out_dim, in_dim, (3, 1, 1), pad_mode="pad", padding=(1, 0, 0), has_bias=True),
+        )
 
         # zero out the last layer params,so the conv block is identity
-        # nn.init.zeros_(self.conv1[-1].weight)
-        # nn.init.zeros_(self.conv1[-1].bias)
-        nn.init.zeros_(self.conv[-1].weight)
-        nn.init.zeros_(self.conv[-1].bias) 
+        self.conv[-1].weight.set_data(init.initializer("zeros", self.conv[-1].weight.shape, self.conv[-1].weight.dtype))
+        self.conv[-1].bias.set_data(init.initializer("zeros", self.conv[-1].bias.shape, self.conv[-1].bias.dtype))
 
-    def forward(self, x):
+    def construct(self, x):
         identity = x
         x = self.conv(x)
         if self.use_image_dataset:
-            x = identity + 0*x
+            x = identity + 0 * x
         else:
             x = identity + x
         return x
 
-class TemporalConvBlock(nn.Module):
 
-    def __init__(self, in_dim, out_dim=None, dropout=0.0, use_image_dataset= False):
+class TemporalConvBlock(nn.Cell):
+    def __init__(self, in_dim, out_dim=None, dropout=0.0, use_image_dataset=False):
         super(TemporalConvBlock, self).__init__()
         if out_dim is None:
-            out_dim = in_dim#int(1.5*in_dim)
+            out_dim = in_dim  # int(1.5*in_dim)
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.use_image_dataset = use_image_dataset
 
         # conv layers
-        self.conv1 = nn.Sequential(
+        self.conv1 = nn.SequentialCell(
             nn.GroupNorm(32, in_dim),
             nn.SiLU(),
-            nn.Conv3d(in_dim, out_dim, (3, 1, 1), padding = (1, 0, 0)))
-        self.conv2 = nn.Sequential(
+            nn.Conv3d(in_dim, out_dim, (3, 1, 1), pad_mode="pad", padding=(1, 0, 0), has_bias=True),
+        )
+        self.conv2 = nn.SequentialCell(
             nn.GroupNorm(32, out_dim),
             nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Conv3d(out_dim, in_dim, (3, 1, 1), padding = (1, 0, 0)))
+            nn.Dropout(p=dropout),
+            nn.Conv3d(out_dim, in_dim, (3, 1, 1), pad_mode="pad", padding=(1, 0, 0), has_bias=True),
+        )
 
         # zero out the last layer params,so the conv block is identity
-        # nn.init.zeros_(self.conv1[-1].weight)
-        # nn.init.zeros_(self.conv1[-1].bias)
-        nn.init.zeros_(self.conv2[-1].weight)
-        nn.init.zeros_(self.conv2[-1].bias) 
+        self.conv2[-1].weight.set_data(
+            init.initializer("zeros", self.conv2[-1].weight.shape, self.conv2[-1].weight.dtype)
+        )
+        self.conv2[-1].bias.set_data(init.initializer("zeros", self.conv2[-1].bias.shape, self.conv2[-1].bias.dtype))
 
-    def forward(self, x):
+    def construct(self, x):
         identity = x
         x = self.conv1(x)
         x = self.conv2(x)
         if self.use_image_dataset:
-            x = identity + 0*x
+            x = identity + 0 * x
         else:
             x = identity + x
         return x
 
-class TemporalConvBlock_v2(nn.Module):
+
+class TemporalConvBlock_v2(nn.Cell):
     def __init__(self, in_dim, out_dim=None, dropout=0.0, use_image_dataset=False):
         super(TemporalConvBlock_v2, self).__init__()
         if out_dim is None:
-            out_dim = in_dim # int(1.5*in_dim)
+            out_dim = in_dim  # int(1.5*in_dim)
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.use_image_dataset = use_image_dataset
 
         # conv layers
-        self.conv1 = nn.Sequential(
+        self.conv1 = nn.SequentialCell(
             nn.GroupNorm(32, in_dim),
             nn.SiLU(),
-            nn.Conv3d(in_dim, out_dim, (3, 1, 1), padding = (1, 0, 0)))
-        self.conv2 = nn.Sequential(
+            nn.Conv3d(in_dim, out_dim, (3, 1, 1), pad_mode="pad", padding=(1, 0, 0), has_bias=True),
+        )
+        self.conv2 = nn.SequentialCell(
             nn.GroupNorm(32, out_dim),
             nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Conv3d(out_dim, in_dim, (3, 1, 1), padding = (1, 0, 0)))
-        self.conv3 = nn.Sequential(
+            nn.Dropout(p=dropout),
+            nn.Conv3d(out_dim, in_dim, (3, 1, 1), pad_mode="pad", padding=(1, 0, 0), has_bias=True),
+        )
+        self.conv3 = nn.SequentialCell(
             nn.GroupNorm(32, out_dim),
             nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Conv3d(out_dim, in_dim, (3, 1, 1), padding = (1, 0, 0)))
-        self.conv4 = nn.Sequential(
+            nn.Dropout(p=dropout),
+            nn.Conv3d(out_dim, in_dim, (3, 1, 1), pad_mode="pad", padding=(1, 0, 0), has_bias=True),
+        )
+        self.conv4 = nn.SequentialCell(
             nn.GroupNorm(32, out_dim),
             nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Conv3d(out_dim, in_dim, (3, 1, 1), padding = (1, 0, 0)))
+            nn.Dropout(p=dropout),
+            nn.Conv3d(out_dim, in_dim, (3, 1, 1), pad_mode="pad", padding=(1, 0, 0), has_bias=True),
+        )
 
         # zero out the last layer params,so the conv block is identity
-        nn.init.zeros_(self.conv4[-1].weight)
-        nn.init.zeros_(self.conv4[-1].bias) 
+        self.conv4[-1].weight.set_data(
+            init.initializer("zeros", self.conv4[-1].weight.shape, self.conv4[-1].weight.dtype)
+        )
+        self.conv4[-1].bias.set_data(init.initializer("zeros", self.conv4[-1].bias.shape, self.conv4[-1].bias.dtype))
 
     def forward(self, x):
         identity = x
@@ -1126,46 +1231,43 @@ class TemporalConvBlock_v2(nn.Module):
         else:
             x = identity + x
         return x
-   
 
 
-
-
-class UNetSD_temporal(nn.Module):
-
-    def __init__(self,
-                 cfg,
-                 in_dim=7,
-                 dim=512,
-                 y_dim=512,
-                 context_dim=512,
-                 hist_dim = 156,
-                 concat_dim = 8,
-                 out_dim=6,
-                 dim_mult=[1, 2, 3, 4],
-                 num_heads=None,
-                 head_dim=64,
-                 num_res_blocks=3,
-                 attn_scales=[1 / 2, 1 / 4, 1 / 8],
-                 use_scale_shift_norm=True,
-                 dropout=0.1,
-                 temporal_attn_times=1,
-                 temporal_attention = True,
-                 use_checkpoint=False,
-                 use_image_dataset=False,
-                 use_fps_condition= False,
-                 use_sim_mask = False,
-                 misc_dropout = 0.5,
-                 training=True,
-                 inpainting=True,
-                 video_compositions = ['text', 'mask'],
-                 p_all_zero=0.1,
-                 p_all_keep=0.1,
-                 zero_y = None,
-                 black_image_feature = None,
-                 ):
+class UNetSD_temporal(nn.Cell):
+    def __init__(
+        self,
+        cfg,
+        in_dim=7,
+        dim=512,
+        y_dim=512,
+        context_dim=512,
+        hist_dim=156,
+        concat_dim=8,
+        out_dim=6,
+        dim_mult=[1, 2, 3, 4],
+        num_heads=None,
+        head_dim=64,
+        num_res_blocks=3,
+        attn_scales=[1 / 2, 1 / 4, 1 / 8],
+        use_scale_shift_norm=True,
+        dropout=0.1,
+        temporal_attn_times=1,
+        temporal_attention=True,
+        use_checkpoint=False,
+        use_image_dataset=False,
+        use_fps_condition=False,
+        use_sim_mask=False,
+        misc_dropout=0.5,
+        training=True,
+        inpainting=True,
+        video_compositions=["text", "mask"],
+        p_all_zero=0.1,
+        p_all_keep=0.1,
+        zero_y=None,
+        black_image_feature=None,
+    ):
         embed_dim = dim * 4
-        num_heads=num_heads if num_heads else dim//32
+        num_heads = num_heads if num_heads else dim // 32
         super(UNetSD_temporal, self).__init__()
         self.zero_y = zero_y
         self.black_image_feature = black_image_feature
@@ -1179,9 +1281,9 @@ class UNetSD_temporal(nn.Module):
         self.embed_dim = embed_dim
         self.out_dim = out_dim
         self.dim_mult = dim_mult
-        ### for temporal attention
+        # for temporal attention
         self.num_heads = num_heads
-        ### for spatial attention
+        # for spatial attention
         self.head_dim = head_dim
         self.num_res_blocks = num_res_blocks
         self.attn_scales = attn_scales
@@ -1192,7 +1294,7 @@ class UNetSD_temporal(nn.Module):
         self.use_image_dataset = use_image_dataset
         self.use_fps_condition = use_fps_condition
         self.use_sim_mask = use_sim_mask
-        self.training=training
+        self.training = training
         self.inpainting = inpainting
         self.video_compositions = video_compositions
         self.misc_dropout = misc_dropout
@@ -1213,212 +1315,393 @@ class UNetSD_temporal(nn.Module):
             adapter_transformer_layers = 1
 
         # embeddings
-        self.time_embed = nn.Sequential(
-            nn.Linear(dim, embed_dim),
-            nn.SiLU(),
-            nn.Linear(embed_dim, embed_dim))
-        self.pre_image_condition = nn.Sequential(
-            nn.Linear(1024, 1024),
-            nn.SiLU(),
-            nn.Linear(1024, 1024))
+        self.time_embed = nn.SequentialCell(nn.Dense(dim, embed_dim), nn.SiLU(), nn.Dense(embed_dim, embed_dim))
+        self.pre_image_condition = nn.SequentialCell(nn.Dense(1024, 1024), nn.SiLU(), nn.Dense(1024, 1024))
 
-        ### depth embedding
-        if 'depthmap' in self.video_compositions:
-            self.depth_embedding = nn.Sequential(
-                nn.Conv2d(1, concat_dim * 4, 3, padding=1),
+        # depth embedding
+        if "depthmap" in self.video_compositions:
+            self.depth_embedding = nn.SequentialCell(
+                nn.Conv2d(1, concat_dim * 4, 3, pad_mode="pad", padding=1, has_bias=True),
                 nn.SiLU(),
                 nn.AdaptiveAvgPool2d((128, 128)),
-                nn.Conv2d(concat_dim * 4, concat_dim * 4, 3, stride=2, padding=1),
+                nn.Conv2d(concat_dim * 4, concat_dim * 4, 3, stride=2, pad_mode="pad", padding=1, has_bias=True),
                 nn.SiLU(),
-                nn.Conv2d(concat_dim * 4, concat_dim, 3, stride=2, padding=1))
-            self.depth_embedding_after = Transformer_v2(heads=2, dim=concat_dim, dim_head_k=concat_dim, dim_head_v=concat_dim, dropout_atte = 0.05, mlp_dim=concat_dim, dropout_ffn = 0.05, depth=adapter_transformer_layers)
-        
-        if 'motion' in self.video_compositions:
-            self.motion_embedding = nn.Sequential(
-                nn.Conv2d(2, concat_dim * 4, 3, padding=1),
-                nn.SiLU(),
-                nn.AdaptiveAvgPool2d((128, 128)),
-                nn.Conv2d(concat_dim * 4, concat_dim * 4, 3, stride=2, padding=1),
-                nn.SiLU(),
-                nn.Conv2d(concat_dim * 4, concat_dim, 3, stride=2, padding=1))
-            self.motion_embedding_after = Transformer_v2(heads=2, dim=concat_dim, dim_head_k=concat_dim, dim_head_v=concat_dim, dropout_atte = 0.05, mlp_dim=concat_dim, dropout_ffn = 0.05, depth=adapter_transformer_layers)
-        
-        ### canny embedding
-        if 'canny' in self.video_compositions:
-            self.canny_embedding = nn.Sequential(
-                nn.Conv2d(1, concat_dim * 4, 3, padding=1),
-                nn.SiLU(),
-                nn.AdaptiveAvgPool2d((128, 128)),
-                nn.Conv2d(concat_dim * 4, concat_dim * 4, 3, stride=2, padding=1),
-                nn.SiLU(),
-                nn.Conv2d(concat_dim * 4, concat_dim, 3, stride=2, padding=1))
-            self.canny_embedding_after = Transformer_v2(heads=2, dim=concat_dim, dim_head_k=concat_dim, dim_head_v=concat_dim, dropout_atte = 0.05, mlp_dim=concat_dim, dropout_ffn = 0.05, depth=adapter_transformer_layers)
+                nn.Conv2d(concat_dim * 4, concat_dim, 3, stride=2, pad_mode="pad", padding=1, has_bias=True),
+            )
+            self.depth_embedding_after = Transformer_v2(
+                heads=2,
+                dim=concat_dim,
+                dim_head_k=concat_dim,
+                dim_head_v=concat_dim,
+                dropout_atte=0.05,
+                mlp_dim=concat_dim,
+                dropout_ffn=0.05,
+                depth=adapter_transformer_layers,
+            )
 
-        ### masked-image embedding
-        if 'mask' in self.video_compositions:
-            self.masked_embedding = nn.Sequential(
-                nn.Conv2d(4, concat_dim * 4, 3, padding=1),
+        if "motion" in self.video_compositions:
+            self.motion_embedding = nn.SequentialCell(
+                nn.Conv2d(2, concat_dim * 4, 3, pad_mode="pad", padding=1, has_bias=True),
                 nn.SiLU(),
                 nn.AdaptiveAvgPool2d((128, 128)),
-                nn.Conv2d(concat_dim * 4, concat_dim * 4, 3, stride=2, padding=1),
+                nn.Conv2d(concat_dim * 4, concat_dim * 4, 3, stride=2, pad_mode="pad", padding=1, has_bias=True),
                 nn.SiLU(),
-                nn.Conv2d(concat_dim * 4, concat_dim, 3, stride=2, padding=1)) if inpainting else None
-            self.mask_embedding_after = Transformer_v2(heads=2, dim=concat_dim, dim_head_k=concat_dim, dim_head_v=concat_dim, dropout_atte = 0.05, mlp_dim=concat_dim, dropout_ffn = 0.05, depth=adapter_transformer_layers)
+                nn.Conv2d(concat_dim * 4, concat_dim, 3, stride=2, pad_mode="pad", padding=1, has_bias=True),
+            )
+            self.motion_embedding_after = Transformer_v2(
+                heads=2,
+                dim=concat_dim,
+                dim_head_k=concat_dim,
+                dim_head_v=concat_dim,
+                dropout_atte=0.05,
+                mlp_dim=concat_dim,
+                dropout_ffn=0.05,
+                depth=adapter_transformer_layers,
+            )
 
-        ### sketch embedding
-        if 'sketch' in self.video_compositions:
-            self.sketch_embedding = nn.Sequential(
-                nn.Conv2d(1, concat_dim * 4, 3, padding=1),
+        # canny embedding
+        if "canny" in self.video_compositions:
+            self.canny_embedding = nn.SequentialCell(
+                nn.Conv2d(1, concat_dim * 4, 3, pad_mode="pad", padding=1, has_bias=True),
                 nn.SiLU(),
                 nn.AdaptiveAvgPool2d((128, 128)),
-                nn.Conv2d(concat_dim * 4, concat_dim * 4, 3, stride=2, padding=1),
+                nn.Conv2d(concat_dim * 4, concat_dim * 4, 3, stride=2, pad_mode="pad", padding=1, has_bias=True),
                 nn.SiLU(),
-                nn.Conv2d(concat_dim * 4, concat_dim, 3, stride=2, padding=1))
-            self.sketch_embedding_after = Transformer_v2(heads=2, dim=concat_dim, dim_head_k=concat_dim, dim_head_v=concat_dim, dropout_atte = 0.05, mlp_dim=concat_dim, dropout_ffn = 0.05, depth=adapter_transformer_layers)
-        
-        if 'single_sketch' in self.video_compositions:
-            self.single_sketch_embedding = nn.Sequential(
-                nn.Conv2d(1, concat_dim * 4, 3, padding=1),
-                nn.SiLU(),
-                nn.AdaptiveAvgPool2d((128, 128)),
-                nn.Conv2d(concat_dim * 4, concat_dim * 4, 3, stride=2, padding=1),
-                nn.SiLU(),
-                nn.Conv2d(concat_dim * 4, concat_dim, 3, stride=2, padding=1))
-            self.single_sketch_embedding_after = Transformer_v2(heads=2, dim=concat_dim, dim_head_k=concat_dim, dim_head_v=concat_dim, dropout_atte = 0.05, mlp_dim=concat_dim, dropout_ffn = 0.05, depth=adapter_transformer_layers)
-        
-        if 'local_image' in self.video_compositions:
-            self.local_image_embedding = nn.Sequential(
-                    nn.Conv2d(3, concat_dim * 4, 3, padding=1),
+                nn.Conv2d(concat_dim * 4, concat_dim, 3, stride=2, pad_mode="pad", padding=1, has_bias=True),
+            )
+            self.canny_embedding_after = Transformer_v2(
+                heads=2,
+                dim=concat_dim,
+                dim_head_k=concat_dim,
+                dim_head_v=concat_dim,
+                dropout_atte=0.05,
+                mlp_dim=concat_dim,
+                dropout_ffn=0.05,
+                depth=adapter_transformer_layers,
+            )
+
+        # masked-image embedding
+        if "mask" in self.video_compositions:
+            self.masked_embedding = (
+                nn.SequentialCell(
+                    nn.Conv2d(4, concat_dim * 4, 3, pad_mode="pad", padding=1, has_bias=True),
                     nn.SiLU(),
                     nn.AdaptiveAvgPool2d((128, 128)),
-                    nn.Conv2d(concat_dim * 4, concat_dim * 4, 3, stride=2, padding=1),
+                    nn.Conv2d(concat_dim * 4, concat_dim * 4, 3, stride=2, pad_mode="pad", padding=1, has_bias=True),
                     nn.SiLU(),
-                    nn.Conv2d(concat_dim * 4, concat_dim, 3, stride=2, padding=1))
-            self.local_image_embedding_after = Transformer_v2(heads=2, dim=concat_dim, dim_head_k=concat_dim, dim_head_v=concat_dim, dropout_atte = 0.05, mlp_dim=concat_dim, dropout_ffn = 0.05, depth=adapter_transformer_layers)
-        
-        ### Condition Dropout
+                    nn.Conv2d(concat_dim * 4, concat_dim, 3, stride=2, pad_mode="pad", padding=1, has_bias=True),
+                )
+                if inpainting
+                else None
+            )
+            self.mask_embedding_after = Transformer_v2(
+                heads=2,
+                dim=concat_dim,
+                dim_head_k=concat_dim,
+                dim_head_v=concat_dim,
+                dropout_atte=0.05,
+                mlp_dim=concat_dim,
+                dropout_ffn=0.05,
+                depth=adapter_transformer_layers,
+            )
+
+        # sketch embedding
+        if "sketch" in self.video_compositions:
+            self.sketch_embedding = nn.SequentialCell(
+                nn.Conv2d(1, concat_dim * 4, 3, pad_mode="pad", padding=1, has_bias=True),
+                nn.SiLU(),
+                nn.AdaptiveAvgPool2d((128, 128)),
+                nn.Conv2d(concat_dim * 4, concat_dim * 4, 3, stride=2, pad_mode="pad", padding=1, has_bias=True),
+                nn.SiLU(),
+                nn.Conv2d(concat_dim * 4, concat_dim, 3, stride=2, pad_mode="pad", padding=1, has_bias=True),
+            )
+            self.sketch_embedding_after = Transformer_v2(
+                heads=2,
+                dim=concat_dim,
+                dim_head_k=concat_dim,
+                dim_head_v=concat_dim,
+                dropout_atte=0.05,
+                mlp_dim=concat_dim,
+                dropout_ffn=0.05,
+                depth=adapter_transformer_layers,
+            )
+
+        if "single_sketch" in self.video_compositions:
+            self.single_sketch_embedding = nn.SequentialCell(
+                nn.Conv2d(1, concat_dim * 4, 3, pad_mode="pad", padding=1, has_bias=True),
+                nn.SiLU(),
+                nn.AdaptiveAvgPool2d((128, 128)),
+                nn.Conv2d(concat_dim * 4, concat_dim * 4, 3, stride=2, pad_mode="pad", padding=1, has_bias=True),
+                nn.SiLU(),
+                nn.Conv2d(concat_dim * 4, concat_dim, 3, stride=2, pad_mode="pad", padding=1, has_bias=True),
+            )
+            self.single_sketch_embedding_after = Transformer_v2(
+                heads=2,
+                dim=concat_dim,
+                dim_head_k=concat_dim,
+                dim_head_v=concat_dim,
+                dropout_atte=0.05,
+                mlp_dim=concat_dim,
+                dropout_ffn=0.05,
+                depth=adapter_transformer_layers,
+            )
+
+        if "local_image" in self.video_compositions:
+            self.local_image_embedding = nn.SequentialCell(
+                nn.Conv2d(3, concat_dim * 4, 3, pad_mode="pad", padding=1, has_bias=True),
+                nn.SiLU(),
+                nn.AdaptiveAvgPool2d((128, 128)),
+                nn.Conv2d(concat_dim * 4, concat_dim * 4, 3, stride=2, pad_mode="pad", padding=1, has_bias=True),
+                nn.SiLU(),
+                nn.Conv2d(concat_dim * 4, concat_dim, 3, stride=2, pad_mode="pad", padding=1, has_bias=True),
+            )
+            self.local_image_embedding_after = Transformer_v2(
+                heads=2,
+                dim=concat_dim,
+                dim_head_k=concat_dim,
+                dim_head_v=concat_dim,
+                dropout_atte=0.05,
+                mlp_dim=concat_dim,
+                dropout_ffn=0.05,
+                depth=adapter_transformer_layers,
+            )
+
+        # Condition Dropout
         self.misc_dropout = DropPath(misc_dropout)
 
         if temporal_attention and not USE_TEMPORAL_TRANSFORMER:
             self.rotary_emb = RotaryEmbedding(min(32, head_dim))
-            self.time_rel_pos_bias = RelativePositionBias(heads = num_heads, max_distance = 32) # realistically will not be able to generate that many frames of video... yet
+            self.time_rel_pos_bias = RelativePositionBias(
+                heads=num_heads, max_distance=32
+            )  # realistically will not be able to generate that many frames of video... yet
 
         if self.use_fps_condition:
-            self.fps_embedding = nn.Sequential(
-                nn.Linear(dim, embed_dim),
-                nn.SiLU(),
-                nn.Linear(embed_dim, embed_dim))
-            nn.init.zeros_(self.fps_embedding[-1].weight)
-            nn.init.zeros_(self.fps_embedding[-1].bias)
+            self.fps_embedding = nn.SequentialCell(nn.Dense(dim, embed_dim), nn.SiLU(), nn.Dense(embed_dim, embed_dim))
+            self.fps_embedding[-1].weight.set_data(
+                init.initializer("zeros", self.fps_embedding[-1].weight.shape, self.fps_embedding[-1].weight.dtype)
+            )
+            self.fps_embedding[-1].bias.set_data(
+                init.initializer("zeros", self.fps_embedding[-1].bias.shape, self.fps_embedding[-1].bias.dtype)
+            )
 
         # encoder
-        self.input_blocks = nn.ModuleList()
+        input_blocks = []
         # init_block = nn.ModuleList([nn.Conv2d(self.in_dim + concat_dim, dim, 3, padding=1)])
         if cfg.resume:
-            self.pre_image = nn.Sequential()
-            init_block = nn.ModuleList([nn.Conv2d(self.in_dim + concat_dim, dim, 3, padding=1)])
+            self.pre_image = nn.SequentialCell()
+            init_block = nn.CellList(
+                [nn.Conv2d(self.in_dim + concat_dim, dim, 3, pad_mode="pad", padding=1, has_bias=True)]
+            )
         else:
-            self.pre_image = nn.Sequential(nn.Conv2d(self.in_dim + concat_dim, self.in_dim, 1, padding=0))
-            init_block = nn.ModuleList([nn.Conv2d(self.in_dim, dim, 3, padding=1)])
+            self.pre_image = nn.SequentialCell(
+                nn.Conv2d(self.in_dim + concat_dim, self.in_dim, 1, padding=0, has_bias=True)
+            )
+            init_block = nn.CellList([nn.Conv2d(self.in_dim, dim, 3, pad_mode="pad", padding=1, has_bias=True)])
 
-
-        #### need an initial temporal attention?
+        # need an initial temporal attention?
         if temporal_attention:
             if USE_TEMPORAL_TRANSFORMER:
-                init_block.append(TemporalTransformer(dim, num_heads, head_dim, depth=transformer_depth, context_dim=context_dim,
-                                disable_self_attn=disabled_sa, use_linear=use_linear_in_temporal, multiply_zero=use_image_dataset))
+                init_block.append(
+                    TemporalTransformer(
+                        dim,
+                        num_heads,
+                        head_dim,
+                        depth=transformer_depth,
+                        context_dim=context_dim,
+                        disable_self_attn=disabled_sa,
+                        use_linear=use_linear_in_temporal,
+                        multiply_zero=use_image_dataset,
+                    )
+                )
             else:
-                init_block.append(TemporalAttentionMultiBlock(dim, num_heads, head_dim, rotary_emb=self.rotary_emb, temporal_attn_times=temporal_attn_times, use_image_dataset=use_image_dataset))
+                init_block.append(
+                    TemporalAttentionMultiBlock(
+                        dim,
+                        num_heads,
+                        head_dim,
+                        rotary_emb=self.rotary_emb,
+                        temporal_attn_times=temporal_attn_times,
+                        use_image_dataset=use_image_dataset,
+                    )
+                )
         # elif temporal_conv:
-        # 
-        self.input_blocks.append(init_block)
+        #
+        input_blocks.append(init_block)
         shortcut_dims.append(dim)
         for i, (in_dim, out_dim) in enumerate(zip(enc_dims[:-1], enc_dims[1:])):
             for j in range(num_res_blocks):
                 # residual (+attention) blocks
-                # 
-                block = nn.ModuleList([ResBlock(in_dim, embed_dim, dropout, out_channels=out_dim, use_scale_shift_norm=False, use_image_dataset=use_image_dataset,)])
-                # 
-                if scale in attn_scales:
-                    # 
-                    block.append(
-                            SpatialTransformer(
-                                out_dim, out_dim // head_dim, head_dim, depth=1, context_dim=self.context_dim,
-                                disable_self_attn=False, use_linear=True
-                            )
-                    )
-                    if self.temporal_attention:
-                        if USE_TEMPORAL_TRANSFORMER:
-                            block.append(TemporalTransformer(out_dim, out_dim // head_dim, head_dim, depth=transformer_depth, context_dim=context_dim,
-                                disable_self_attn=disabled_sa, use_linear=use_linear_in_temporal, multiply_zero=use_image_dataset))
-                        else:
-                            block.append(TemporalAttentionMultiBlock(out_dim, num_heads, head_dim, rotary_emb = self.rotary_emb, use_image_dataset=use_image_dataset, use_sim_mask=use_sim_mask, temporal_attn_times=temporal_attn_times))
-                in_dim = out_dim
-                self.input_blocks.append(block)
-                shortcut_dims.append(out_dim)
-
-                # downsample
-                if i != len(dim_mult) - 1 and j == num_res_blocks - 1:
-                    # 
-                    downsample = Downsample(
-                        out_dim, True, dims=2, out_channels=out_dim
-                    )
-                    shortcut_dims.append(out_dim)
-                    scale /= 2.0
-                    # block.append(TemporalConvBlock(out_dim,dropout=dropout,use_image_dataset=use_image_dataset))
-                    self.input_blocks.append(downsample)
-        
-        # middle
-        self.middle_block = nn.ModuleList([
-            ResBlock(out_dim, embed_dim, dropout, use_scale_shift_norm=False, use_image_dataset=use_image_dataset,),
-            
-            SpatialTransformer(
-                out_dim, out_dim // head_dim, head_dim, depth=1, context_dim=self.context_dim,
-                disable_self_attn=False, use_linear=True
-            )])        
-        
-        if self.temporal_attention:
-            if USE_TEMPORAL_TRANSFORMER:
-                self.middle_block.append(
-                 TemporalTransformer( 
-                            out_dim, out_dim // head_dim, head_dim, depth=transformer_depth, context_dim=context_dim,
-                            disable_self_attn=disabled_sa, use_linear=use_linear_in_temporal,
-                            multiply_zero=use_image_dataset,
+                block = nn.CellList(
+                    [
+                        ResBlock(
+                            in_dim,
+                            embed_dim,
+                            dropout,
+                            out_channels=out_dim,
+                            use_scale_shift_norm=False,
+                            use_image_dataset=use_image_dataset,
                         )
+                    ]
                 )
-            else:
-                self.middle_block.append(TemporalAttentionMultiBlock(out_dim, num_heads, head_dim, rotary_emb =  self.rotary_emb, use_image_dataset=use_image_dataset, use_sim_mask=use_sim_mask, temporal_attn_times=temporal_attn_times))        
-
-        # self.middle.append(ResidualBlock(out_dim, embed_dim, out_dim, use_scale_shift_norm, 'none'))
-        self.middle_block.append(ResBlock(out_dim, embed_dim, dropout, use_scale_shift_norm=False))
-        # self.middle.append(TemporalConvBlock(out_dim,dropout=dropout,use_image_dataset=use_image_dataset))
-
-        # decoder
-        self.output_blocks = nn.ModuleList()
-        for i, (in_dim, out_dim) in enumerate(zip(dec_dims[:-1], dec_dims[1:])):
-            for j in range(num_res_blocks + 1):
-                # residual (+attention) blocks
-                # block = nn.ModuleList([ResidualBlock(in_dim + shortcut_dims.pop(), embed_dim, out_dim, use_scale_shift_norm, 'none')])
-                block = nn.ModuleList([ResBlock(in_dim + shortcut_dims.pop(), embed_dim, dropout, out_dim, use_scale_shift_norm=False, use_image_dataset=use_image_dataset, )])
-                # block.append(TemporalConvBlock(out_dim,dropout=dropout,use_image_dataset=use_image_dataset))
                 if scale in attn_scales:
-                    # block.append(FlashAttentionBlock(out_dim, context_dim, num_heads, head_dim))
                     block.append(
                         SpatialTransformer(
-                            out_dim, out_dim // head_dim, head_dim, depth=1, context_dim=1024,
-                            disable_self_attn=False, use_linear=True
+                            out_dim,
+                            out_dim // head_dim,
+                            head_dim,
+                            depth=1,
+                            context_dim=self.context_dim,
+                            disable_self_attn=False,
+                            use_linear=True,
                         )
                     )
                     if self.temporal_attention:
                         if USE_TEMPORAL_TRANSFORMER:
                             block.append(
                                 TemporalTransformer(
-                                    out_dim, out_dim // head_dim, head_dim, depth=transformer_depth, context_dim=context_dim,
-                                    disable_self_attn=disabled_sa, use_linear=use_linear_in_temporal, multiply_zero=use_image_dataset
-                                    )
+                                    out_dim,
+                                    out_dim // head_dim,
+                                    head_dim,
+                                    depth=transformer_depth,
+                                    context_dim=context_dim,
+                                    disable_self_attn=disabled_sa,
+                                    use_linear=use_linear_in_temporal,
+                                    multiply_zero=use_image_dataset,
+                                )
                             )
                         else:
-                            block.append(TemporalAttentionMultiBlock(out_dim, num_heads, head_dim, rotary_emb =self.rotary_emb, use_image_dataset=use_image_dataset, use_sim_mask=use_sim_mask, temporal_attn_times=temporal_attn_times))
+                            block.append(
+                                TemporalAttentionMultiBlock(
+                                    out_dim,
+                                    num_heads,
+                                    head_dim,
+                                    rotary_emb=self.rotary_emb,
+                                    use_image_dataset=use_image_dataset,
+                                    use_sim_mask=use_sim_mask,
+                                    temporal_attn_times=temporal_attn_times,
+                                )
+                            )
+                in_dim = out_dim
+                input_blocks.append(block)
+                shortcut_dims.append(out_dim)
+
+                # downsample
+                if i != len(dim_mult) - 1 and j == num_res_blocks - 1:
+                    downsample = Downsample(out_dim, True, dims=2, out_channels=out_dim)
+                    shortcut_dims.append(out_dim)
+                    scale /= 2.0
+                    # block.append(TemporalConvBlock(out_dim,dropout=dropout,use_image_dataset=use_image_dataset))
+                    input_blocks.append(downsample)
+        self.input_blocks = nn.SequentialCell(input_blocks)
+
+        # middle
+        middle_block = [
+            ResBlock(
+                out_dim,
+                embed_dim,
+                dropout,
+                use_scale_shift_norm=False,
+                use_image_dataset=use_image_dataset,
+            ),
+            SpatialTransformer(
+                out_dim,
+                out_dim // head_dim,
+                head_dim,
+                depth=1,
+                context_dim=self.context_dim,
+                disable_self_attn=False,
+                use_linear=True,
+            ),
+        ]
+
+        if self.temporal_attention:
+            if USE_TEMPORAL_TRANSFORMER:
+                middle_block.append(
+                    TemporalTransformer(
+                        out_dim,
+                        out_dim // head_dim,
+                        head_dim,
+                        depth=transformer_depth,
+                        context_dim=context_dim,
+                        disable_self_attn=disabled_sa,
+                        use_linear=use_linear_in_temporal,
+                        multiply_zero=use_image_dataset,
+                    )
+                )
+            else:
+                middle_block.append(
+                    TemporalAttentionMultiBlock(
+                        out_dim,
+                        num_heads,
+                        head_dim,
+                        rotary_emb=self.rotary_emb,
+                        use_image_dataset=use_image_dataset,
+                        use_sim_mask=use_sim_mask,
+                        temporal_attn_times=temporal_attn_times,
+                    )
+                )
+
+        # self.middle.append(ResidualBlock(out_dim, embed_dim, out_dim, use_scale_shift_norm, 'none'))
+        middle_block.append(ResBlock(out_dim, embed_dim, dropout, use_scale_shift_norm=False))
+        # self.middle.append(TemporalConvBlock(out_dim,dropout=dropout,use_image_dataset=use_image_dataset))
+        self.middle_block = nn.CellList(middle_block)
+
+        # decoder
+        output_blocks = []
+        for i, (in_dim, out_dim) in enumerate(zip(dec_dims[:-1], dec_dims[1:])):
+            for j in range(num_res_blocks + 1):
+                # residual (+attention) blocks
+                # block = nn.ModuleList([ResidualBlock(in_dim + shortcut_dims.pop(), embed_dim, out_dim, use_scale_shift_norm, 'none')])
+                block = [
+                    ResBlock(
+                        in_dim + shortcut_dims.pop(),
+                        embed_dim,
+                        dropout,
+                        out_dim,
+                        use_scale_shift_norm=False,
+                        use_image_dataset=use_image_dataset,
+                    )
+                ]
+                # block.append(TemporalConvBlock(out_dim,dropout=dropout,use_image_dataset=use_image_dataset))
+                if scale in attn_scales:
+                    # block.append(FlashAttentionBlock(out_dim, context_dim, num_heads, head_dim))
+                    block.append(
+                        SpatialTransformer(
+                            out_dim,
+                            out_dim // head_dim,
+                            head_dim,
+                            depth=1,
+                            context_dim=1024,
+                            disable_self_attn=False,
+                            use_linear=True,
+                        )
+                    )
+                    if self.temporal_attention:
+                        if USE_TEMPORAL_TRANSFORMER:
+                            block.append(
+                                TemporalTransformer(
+                                    out_dim,
+                                    out_dim // head_dim,
+                                    head_dim,
+                                    depth=transformer_depth,
+                                    context_dim=context_dim,
+                                    disable_self_attn=disabled_sa,
+                                    use_linear=use_linear_in_temporal,
+                                    multiply_zero=use_image_dataset,
+                                )
+                            )
+                        else:
+                            block.append(
+                                TemporalAttentionMultiBlock(
+                                    out_dim,
+                                    num_heads,
+                                    head_dim,
+                                    rotary_emb=self.rotary_emb,
+                                    use_image_dataset=use_image_dataset,
+                                    use_sim_mask=use_sim_mask,
+                                    temporal_attn_times=temporal_attn_times,
+                                )
+                            )
                 in_dim = out_dim
 
                 # upsample
@@ -1428,42 +1711,44 @@ class UNetSD_temporal(nn.Module):
                     scale *= 2.0
                     block.append(upsample)
                     # block.append(TemporalConvBlock(out_dim,dropout=dropout,use_image_dataset=use_image_dataset))
-                self.output_blocks.append(block)
+                block = nn.CellList(block)
+                output_blocks.append(block)
+
+        self.output_blocks = nn.CellList(output_blocks)
 
         # head
-        self.out = nn.Sequential(
+        self.out = nn.SequentialCell(
             nn.GroupNorm(32, out_dim),
             nn.SiLU(),
-            nn.Conv2d(out_dim, self.out_dim, 3, padding=1))
-        
+            nn.Conv2d(out_dim, self.out_dim, 3, pad_mode="pad", padding=1, has_bias=True),
+        )
+
         # zero out the last layer params
-        nn.init.zeros_(self.out[-1].weight)
-    
-    def forward(self, 
+        self.out[-1].weight.set_data(init.initializer("zeros", self.out[-1].weight.shape, self.out[-1].weight.dtype))
+
+    def construct(
+        self,
         x,
         t,
-        y = None,
-        depth = None,
-        image = None,
-        motion = None,
-        local_image = None,
-        single_sketch = None,
-        masked = None,
-        canny = None,
-        sketch = None,
-        histogram = None,
-        fps = None,
-        video_mask = None,
-        focus_present_mask = None,
-        prob_focus_present = 0.,  # probability at which a given batch sample will focus on the present (0. is all off, 1. is completely arrested attention across time)
-        mask_last_frame_num = 0  # mask last frame num
-        ):
+        y=None,
+        depth=None,
+        image=None,
+        motion=None,
+        local_image=None,
+        single_sketch=None,
+        masked=None,
+        canny=None,
+        sketch=None,
+        histogram=None,
+        fps=None,
+        video_mask=None,
+        focus_present_mask=None,
+        prob_focus_present=0.0,  # probability at which a given batch sample will focus on the present (0. is all off, 1. is completely arrested attention across time)
+        mask_last_frame_num=0,  # mask last frame num
+    ):
+        assert self.inpainting or masked is None, "inpainting is not supported"
 
-        
-        assert self.inpainting or masked is None, 'inpainting is not supported'
-
-        batch, c, f, h, w= x.shape
-        device = x.device
+        batch, c, f, h, w = x.shape
         self.batch = batch
 
         #### image and video joint training, if mask_last_frame_num is set, prob_focus_present will be ignored
@@ -1471,355 +1756,452 @@ class UNetSD_temporal(nn.Module):
             focus_present_mask = None
             video_mask[-mask_last_frame_num:] = False
         else:
-            focus_present_mask = default(focus_present_mask, lambda: prob_mask_like((batch,), prob_focus_present, device = device))
+            focus_present_mask = default(focus_present_mask, lambda: prob_mask_like((batch,), prob_focus_present))
             # if focus_present_mask.all():
             #     print(focus_present_mask)
 
         if self.temporal_attention and not USE_TEMPORAL_TRANSFORMER:
-            time_rel_pos_bias = self.time_rel_pos_bias(x.shape[2], device = x.device)
+            time_rel_pos_bias = self.time_rel_pos_bias(x.shape[2])
         else:
             time_rel_pos_bias = None
-        
 
         # all-zero and all-keep masks
-        zero = torch.zeros(batch, dtype=torch.bool).to(x.device)
-        keep = torch.zeros(batch, dtype=torch.bool).to(x.device)
+        zero = ops.zeros(batch, dtype=ms.bool_)
+        keep = ops.zeros(batch, dtype=ms.bool_)
         if self.training:
-            nzero = (torch.rand(batch) < self.p_all_zero).sum()
-            nkeep = (torch.rand(batch) < self.p_all_keep).sum()
-            index = torch.randperm(batch)
+            nzero = (ops.rand(batch) < self.p_all_zero).sum()
+            nkeep = (ops.rand(batch) < self.p_all_keep).sum()
+            index = ops.randperm(batch)
             zero[index[0:nzero]] = True
-            keep[index[nzero:nzero + nkeep]] = True
+            keep[index[nzero : nzero + nkeep]] = True
         assert not (zero & keep).any()
-        misc_dropout = partial(self.misc_dropout, zero = zero, keep = keep)
+        misc_dropout = partial(self.misc_dropout, zero=zero, keep=keep)
 
-
-        concat = x.new_zeros(batch, self.concat_dim, f, h, w)
+        concat = x.new_zeros((batch, self.concat_dim, f, h, w))
         if depth is not None:
-            ### DropPath mask
-            depth = rearrange(depth, 'b c f h w -> (b f) c h w')
+            # DropPath mask
+            # b c f h w -> b f c h w -> (b f) c h w
+            depth = ops.transpose(depth, (0, 2, 1, 3, 4))
+            depth - ops.reshape(depth, (-1, *depth.shape[2:]))
             depth = self.depth_embedding(depth)
             h = depth.shape[2]
-            depth = self.depth_embedding_after(rearrange(depth, '(b f) c h w -> (b h w) f c', b = batch))
+            # (b f) c h w -> b f c h w -> b h w f c -> (b h w) f c
+            depth = ops.reshape(depth, (batch, depth.shape[0] // batch, *depth.shape[1:]))
+            depth = ops.transpose(depth, (0, 3, 4, 1, 2))
+            depth = ops.reshape(depth, (-1, *depth[3:]))
+            depth = self.depth_embedding_after(depth)
 
-            # 
-            depth = rearrange(depth, '(b h w) f c -> b c f h w', b = batch, h = h)
+            # (b h w) f c -> b h w f c -> b c f h w
+            depth = ops.reshape(depth, (batch, h, depth.shape[0] // (batch * h), *depth.shape[1:]))
+            depth = ops.transpose(depth, (0, 4, 3, 1, 2))
             concat = concat + misc_dropout(depth)
-            
-            
+
         # local_image_embedding
         if local_image is not None:
-            local_image = rearrange(local_image, 'b c f h w -> (b f) c h w')
+            # b c f h w -> b f c h w -> (b f) c h w
+            local_image = ops.transpose(local_image, (0, 2, 1, 3, 4))
+            local_image = ops.reshape(local_image, (-1, *local_image.shape[2:]))
             local_image = self.local_image_embedding(local_image)
 
             h = local_image.shape[2]
-            local_image = self.local_image_embedding_after(rearrange(local_image, '(b f) c h w -> (b h w) f c', b = batch))
-            local_image = rearrange(local_image, '(b h w) f c -> b c f h w', b = batch, h = h)
-
-            # 
+            # (b f) c h w -> b f c h w -> b h w f c -> (b h w) f c
+            local_image = ops.reshape(local_image, (batch, local_image.shape[0] // batch, *local_image.shape[1:]))
+            local_image = ops.transpose(local_image, (0, 3, 4, 1, 2))
+            local_image = ops.reshape(local_image, (-1, local_image.shape[3:]))
+            local_image = self.local_image_embedding_after(local_image)
+            # (b h w) f c -> b h w f c -> b c f h w
+            local_image = ops.reshape(
+                local_image, (batch, h, local_image.shape[0] // (batch * h), *local_image.shape[1:])
+            )
+            local_image = ops.transpose(local_image, (0, 4, 3, 1, 2))
             concat = concat + misc_dropout(local_image)
-        
+
         if motion is not None:
-            motion = rearrange(motion, 'b c f h w -> (b f) c h w')
+            # b c f h w -> b f c h w -> (b f) c h w
+            motion = ops.transpose(motion, (0, 2, 1, 3, 4))
+            motion = ops.reshape(motion, (-1, *motion.shape[2:]))
             motion = self.motion_embedding(motion)
 
             h = motion.shape[2]
-            motion = self.motion_embedding_after(rearrange(motion, '(b f) c h w -> (b h w) f c', b = batch))
-            motion = rearrange(motion, '(b h w) f c -> b c f h w', b = batch, h = h)
+            # (b f) c h w -> b f c h w -> b h w f c -> (b h w) f c
+            motion = ops.reshape(motion, (batch, motion.shape[0] // batch, *motion.shape[1:]))
+            motion = ops.transpose(motion, (0, 3, 4, 1, 2))
+            motion = ops.reshape(motion, (-1, *motion.shape[3:]))
+            motion = self.motion_embedding_after(motion)
+            # (b h w) f c -> b h w f c -> b c f h w
+            motion = ops.reshape(motion, (batch, h, motion.shape[0] // (batch * h), *motion.shape[1:]))
+            motion = ops.transpose(motion, (0, 4, 3, 1, 2))
 
-            # 
             if hasattr(self.cfg, "p_zero_motion_alone") and self.cfg.p_zero_motion_alone and self.training:
-                motion_d = torch.rand(batch) < self.cfg.p_zero_motion
-                motion_d = motion_d[:,None,None,None,None]
-                motion = motion.masked_fill(motion_d.cuda(),0)
+                motion_d = ops.rand(batch) < self.cfg.p_zero_motion
+                motion_d = motion_d[:, None, None, None, None]
+                motion = motion.masked_fill(motion_d, 0)
                 concat = concat + motion
             else:
                 concat = concat + misc_dropout(motion)
-            
 
         if canny is not None:
-            ### DropPath mask
-            canny = rearrange(canny, 'b c f h w -> (b f) c h w')
+            # DropPath mask
+            # b c f h w -> b f c h w -> (b f) c h w
+            canny = ops.transpose(canny, (0, 2, 1, 3, 4))
+            canny = ops.reshape(canny, (-1, *canny.shape[2:]))
             canny = self.canny_embedding(canny)
 
             h = canny.shape[2]
-            canny = self.canny_embedding_after(rearrange(canny, '(b f) c h w -> (b h w) f c', b = batch))
-            canny = rearrange(canny, '(b h w) f c -> b c f h w', b = batch, h = h)
-
-            # 
+            # (b f) c h w -> b f c h w -> b h w f c -> (b h w) f c
+            canny = ops.reshape(canny, (batch, canny.shape[0] // batch, *canny.shape[1:]))
+            canny = ops.transpose(canny, (0, 3, 4, 1, 2))
+            canny = ops.reshape(canny, (-1, *canny.shape[3:]))
+            canny = self.canny_embedding_after(canny)
+            # (b h w) f c -> b h w f c -> b c f h w
+            canny = ops.reshape(canny, (batch, h, canny.shape[0] // (batch * h), *canny.shape[1:]))
+            canny = ops.transpose(canny, (0, 4, 3, 1, 2))
             concat = concat + misc_dropout(canny)
-            
-            
-        
+
         if sketch is not None:
-            ### DropPath mask
-            sketch = rearrange(sketch, 'b c f h w -> (b f) c h w')
+            # DropPath mask
+            # b c f h w -> b f c h w -> (b f) c h w
+            sketch = ops.transpose(sketch, (0, 2, 1, 3, 4))
+            sketch = ops.reshape(sketch, (-1, *sketch.shape[2:]))
             sketch = self.sketch_embedding(sketch)
 
             h = sketch.shape[2]
-            sketch = self.sketch_embedding_after(rearrange(sketch, '(b f) c h w -> (b h w) f c', b = batch))
-            sketch = rearrange(sketch, '(b h w) f c -> b c f h w', b = batch, h = h)
-
-            # 
+            # (b f) c h w -> b f c h w -> b h w f c -> (b h w) f c
+            sketch = ops.reshape(sketch, (batch, sketch.shape[0] // batch, *sketch.shape[1:]))
+            sketch = ops.transpose(sketch, (0, 3, 4, 1, 2))
+            sketch = ops.reshape(sketch, (-1, *sketch.shape[3:]))
+            sketch = self.sketch_embedding_after(sketch)
+            # (b h w) f c -> b h w f c -> b c f h w
+            sketch = ops.reshape(sketch, (batch, h, sketch.shape[0] // (batch * h), *sketch.shape[1:]))
+            sketch = ops.transpose(sketch, (0, 4, 3, 1, 2))
             concat = concat + misc_dropout(sketch)
-        
+
         if single_sketch is not None:
-            ### DropPath mask
-            single_sketch = rearrange(single_sketch, 'b c f h w -> (b f) c h w')
+            # DropPath mask
+            # b c f h w -> b f c h w -> (b f) c h w
+            single_sketch = ops.transpose(single_sketch, (0, 2, 1, 3, 4))
+            single_sketch = ops.reshape(single_sketch, (-1, *single_sketch.shape[2:]))
             single_sketch = self.single_sketch_embedding(single_sketch)
 
             h = single_sketch.shape[2]
-            single_sketch = self.single_sketch_embedding_after(rearrange(single_sketch, '(b f) c h w -> (b h w) f c', b = batch))
-            single_sketch = rearrange(single_sketch, '(b h w) f c -> b c f h w', b = batch, h = h)
-
-            # 
+            # (b f) c h w -> b f c h w -> b h w f c -> (b h w) f c
+            single_sketch = ops.reshape(
+                single_sketch, (batch, single_sketch.shape[0] // batch, *single_sketch.shape[1:])
+            )
+            single_sketch = ops.transpose(single_sketch, (0, 3, 4, 1, 2))
+            single_sketch = ops.reshape(single_sketch, (-1, *single_sketch.shape[3:]))
+            single_sketch = self.single_sketch_embedding_after(single_sketch)
+            # (b h w) f c -> b h w f c -> b c f h w
+            single_sketch = ops.reshape(
+                single_sketch, (batch, h, single_sketch.shape[0] // (batch * h), *single_sketch.shape[1:])
+            )
+            single_sketch = ops.transpose(single_sketch, (0, 4, 3, 1, 2))
             concat = concat + misc_dropout(single_sketch)
-            
-        
-        
 
         if masked is not None:
-            ### DropPath mask
-            masked = rearrange(masked, 'b c f h w -> (b f) c h w')
+            # DropPath mask
+            # b c f h w -> b f c h w -> (b f) c h w
+            masked = ops.transpose(masked, (0, 2, 1, 3, 4))
+            masked = ops.reshape(masked, (-1, *masked.shape[2:]))
             masked = self.masked_embedding(masked)
 
             h = masked.shape[2]
-            masked = self.mask_embedding_after(rearrange(masked, '(b f) c h w -> (b h w) f c', b = batch))
-            masked = rearrange(masked, '(b h w) f c -> b c f h w', b = batch, h = h)
-
-            # 
+            # (b f) c h w -> b f c h w -> b h w f c -> (b h w) f c
+            masked = ops.reshape(masked, (batch, masked.shape[0] // batch, *masked.shape[1:]))
+            masked = ops.transpose(masked, (0, 3, 4, 1, 2))
+            masked = ops.reshape(masked, (-1, *masked.shape[3:]))
+            masked = self.mask_embedding_after(masked)
+            # (b h w) f c -> b h w f c -> b c f h w
+            masked = ops.reshape(masked, (batch, h, masked.shape[0] // (batch * h), *masked.shape[1:]))
+            masked = ops.transpose(masked, (0, 4, 3, 1, 2))
             concat = concat + misc_dropout(masked)
-            
-            
 
-        x = torch.cat([x, concat], dim=1)
-        x = rearrange(x, 'b c f h w -> (b f) c h w')
+        x = ops.cat([x, concat], axis=1)
+        # b c f h w -> b f c h w -> (b f) c h w
+        x = ops.transpose(x, (0, 2, 1, 3, 4))
+        x = ops.reshape(x, (-1, *x.shape[2:]))
         x = self.pre_image(x)
-        x = rearrange(x, '(b f) c h w -> b c f h w', b = batch)
+        # (b f) c h w -> b f c h w -> b c f h w
+        x = ops.reshape(x, (batch, x.shape[0] // batch, *x.shape[1:]))
+        x = ops.transpose(x, (0, 2, 1, 3, 4))
 
         # embeddings
         if self.use_fps_condition and fps is not None:
-            e = self.time_embed(sinusoidal_embedding(t, self.dim)) + self.fps_embedding(sinusoidal_embedding(fps, self.dim))
+            e = self.time_embed(sinusoidal_embedding(t, self.dim)) + self.fps_embedding(
+                sinusoidal_embedding(fps, self.dim)
+            )
         else:
-            e = self.time_embed(sinusoidal_embedding(t, self.dim)) 
-        
-        context = x.new_zeros(batch, 0, self.context_dim)
+            e = self.time_embed(sinusoidal_embedding(t, self.dim))
+
+        context = x.new_zeros((batch, 0, self.context_dim))
         if y is not None:
-            y_context = misc_dropout(y)  
-            context = torch.cat([context, y_context], dim=1)
+            y_context = misc_dropout(y)
+            context = ops.cat([context, y_context], axis=1)
         else:
             y_context = self.zero_y.repeat(batch, 1, 1)
-            context = torch.cat([context, y_context], dim=1)
+            context = ops.cat([context, y_context], axis=1)
 
         if image is not None:
-            image_context = misc_dropout(self.pre_image_condition(image))  
-            context = torch.cat([context, image_context], dim=1)
+            image_context = misc_dropout(self.pre_image_condition(image))
+            context = ops.cat([context, image_context], axis=1)
 
-        # repeat f times for spatial e and context   
-        e = e.repeat_interleave(repeats=f, dim=0) 
-        context = context.repeat_interleave(repeats=f, dim=0) 
+        # repeat f times for spatial e and context
+        e = e.repeat_interleave(repeats=f, dim=0)
+        context = context.repeat_interleave(repeats=f, dim=0)
 
-
-
-        ## always in shape (b f) c h w, except for temporal layer
-        x = rearrange(x, 'b c f h w -> (b f) c h w')
+        # always in shape (b f) c h w, except for temporal layer
+        # b c f h w -> b f c h w -> (b f) c h w
+        x = ops.transpose(x, (0, 2, 1, 3, 4))
+        x = ops.reshape(x, (-1, *x.shape[2:]))
         # encoder
         xs = []
         for block in self.input_blocks:
             x = self._forward_single(block, x, e, context, time_rel_pos_bias, focus_present_mask, video_mask)
             xs.append(x)
-        
+
         # middle
         for block in self.middle_block:
-            x = self._forward_single(block, x, e, context, time_rel_pos_bias,focus_present_mask, video_mask)
-        
+            x = self._forward_single(block, x, e, context, time_rel_pos_bias, focus_present_mask, video_mask)
+
         # decoder
         for block in self.output_blocks:
-            x = torch.cat([x, xs.pop()], dim=1)
-            x = self._forward_single(block, x, e, context, time_rel_pos_bias,focus_present_mask, video_mask, reference=xs[-1] if len(xs) > 0 else None)
-        
+            x = ops.cat([x, xs.pop()], axis=1)
+            x = self._forward_single(
+                block,
+                x,
+                e,
+                context,
+                time_rel_pos_bias,
+                focus_present_mask,
+                video_mask,
+                reference=xs[-1] if len(xs) > 0 else None,
+            )
+
         # head
         x = self.out(x)
 
         # reshape back to (b c f h w)
-        x = rearrange(x, '(b f) c h w -> b c f h w', b = batch)
+        # (b f) c h w -> b f c h w -> b c f h w
+        x = ops.reshape(x, (batch, x.shape[0] // batch, *x.shape[1:]))
+        x = ops.transpose(x, (0, 2, 1, 3, 4))
         return x
-    
+
     def _forward_single(self, module, x, e, context, time_rel_pos_bias, focus_present_mask, video_mask, reference=None):
+        if self.use_checkpoint:
+            raise NotImplementedError("Activation checkpointing is not supported for now!")
         if isinstance(module, ResidualBlock):
-            module = checkpoint_wrapper(module) if self.use_checkpoint else module
-            x = x.contiguous()
             x = module(x, e, reference)
         elif isinstance(module, ResBlock):
-            module = checkpoint_wrapper(module) if self.use_checkpoint else module
-            x = x.contiguous()
             x = module(x, e, self.batch)
         elif isinstance(module, SpatialTransformer):
-            module = checkpoint_wrapper(module) if self.use_checkpoint else module
             x = module(x, context)
         elif isinstance(module, TemporalTransformer):
-            module = checkpoint_wrapper(module) if self.use_checkpoint else module
-            x = rearrange(x, '(b f) c h w -> b c f h w', b = self.batch)
+            # (b f) c h w -> b f c h w -> b c f h w
+            x = ops.reshape(x, (self.batch, x.shape[0] // self.batch, *x.shape[1:]))
+            x = ops.transpose(x, (0, 2, 1, 3, 4))
             x = module(x, context)
-            x = rearrange(x, 'b c f h w -> (b f) c h w')
+            # b c f h w -> b f c h w -> (b f) c h w
+            x = ops.transpose(x, (0, 2, 1, 3, 4))
+            x = ops.reshape(x, (-1, *x.shape[2:]))
         elif isinstance(module, CrossAttention):
-            module = checkpoint_wrapper(module) if self.use_checkpoint else module
             x = module(x, context)
         elif isinstance(module, MemoryEfficientCrossAttention):
-            module = checkpoint_wrapper(module) if self.use_checkpoint else module
             x = module(x, context)
         elif isinstance(module, BasicTransformerBlock):
-            module = checkpoint_wrapper(module) if self.use_checkpoint else module
             x = module(x, context)
         elif isinstance(module, FeedForward):
-            # module = checkpoint_wrapper(module) if self.use_checkpoint else module
             x = module(x, context)
         elif isinstance(module, Upsample):
-            # module = checkpoint_wrapper(module) if self.use_checkpoint else module
             x = module(x)
         elif isinstance(module, Downsample):
-            # module = checkpoint_wrapper(module) if self.use_checkpoint else module
             x = module(x)
         elif isinstance(module, Resample):
-            # module = checkpoint_wrapper(module) if self.use_checkpoint else module
             x = module(x, reference)
         elif isinstance(module, TemporalAttentionBlock):
-            module = checkpoint_wrapper(module) if self.use_checkpoint else module
-            x = rearrange(x, '(b f) c h w -> b c f h w', b = self.batch)
+            # (b f) c h w -> b f c h w -> b c f h w
+            x = ops.reshape(x, (self.batch, x.shape[0] // self.batch, *x.shape[1:]))
+            x = ops.transpose(x, (0, 2, 1, 3, 4))
             x = module(x, time_rel_pos_bias, focus_present_mask, video_mask)
-            x = rearrange(x, 'b c f h w -> (b f) c h w')
+            # b c f h w -> b f c h w -> (b f) c h w
+            x = ops.transpose(x, (0, 2, 1, 3, 4))
+            x = ops.reshape(x, (-1, *x.shape[2:]))
         elif isinstance(module, TemporalAttentionMultiBlock):
-            module = checkpoint_wrapper(module) if self.use_checkpoint else module
-            x = rearrange(x, '(b f) c h w -> b c f h w', b = self.batch)
+            # (b f) c h w -> b f c h w -> b c f h w
+            x = ops.reshape(x, (self.batch, x.shape[0] // self.batch, *x.shape[1:]))
+            x = ops.transpose(x, (0, 2, 1, 3, 4))
             x = module(x, time_rel_pos_bias, focus_present_mask, video_mask)
-            x = rearrange(x, 'b c f h w -> (b f) c h w')
+            # b c f h w -> b f c h w -> (b f) c h w
+            x = ops.transpose(x, (0, 2, 1, 3, 4))
+            x = ops.reshape(x, (-1, *x.shape[2:]))
         elif isinstance(module, InitTemporalConvBlock):
-            module = checkpoint_wrapper(module) if self.use_checkpoint else module
-            x = rearrange(x, '(b f) c h w -> b c f h w', b = self.batch)
+            # (b f) c h w -> b f c h w -> b c f h w
+            x = ops.reshape(x, (self.batch, x.shape[0] // self.batch, *x.shape[1:]))
+            x = ops.transpose(x, (0, 2, 1, 3, 4))
             x = module(x)
-            x = rearrange(x, 'b c f h w -> (b f) c h w')
+            # b c f h w -> b f c h w -> (b f) c h w
+            x = ops.transpose(x, (0, 2, 1, 3, 4))
+            x = ops.reshape(x, (-1, *x.shape[2:]))
         elif isinstance(module, TemporalConvBlock):
-            module = checkpoint_wrapper(module) if self.use_checkpoint else module
-            x = rearrange(x, '(b f) c h w -> b c f h w', b = self.batch)
+            # (b f) c h w -> b f c h w -> b c f h w
+            x = ops.reshape(x, (self.batch, x.shape[0] // self.batch, *x.shape[1:]))
+            x = ops.transpose(x, (0, 2, 1, 3, 4))
             x = module(x)
-            x = rearrange(x, 'b c f h w -> (b f) c h w')
-        elif isinstance(module, nn.ModuleList):
+            # b c f h w -> b f c h w -> (b f) c h w
+            x = ops.transpose(x, (0, 2, 1, 3, 4))
+            x = ops.reshape(x, (-1, *x.shape[2:]))
+        elif isinstance(module, nn.CellList):
             for block in module:
-                x = self._forward_single(block,  x, e, context, time_rel_pos_bias, focus_present_mask, video_mask, reference)
+                x = self._forward_single(
+                    block, x, e, context, time_rel_pos_bias, focus_present_mask, video_mask, reference
+                )
         else:
             x = module(x)
         return x
 
 
-
-class PreNormattention(nn.Module):
+class PreNormattention(nn.Cell):
     def __init__(self, dim, fn):
         super().__init__()
         self.norm = nn.LayerNorm(dim)
         self.fn = fn
-    def forward(self, x, **kwargs):
+
+    def construct(self, x, **kwargs):
         return self.fn(self.norm(x), **kwargs) + x
 
-class PreNormattention_qkv(nn.Module):
+
+class PreNormattention_qkv(nn.Cell):
     def __init__(self, dim, fn):
         super().__init__()
         self.norm = nn.LayerNorm(dim)
         self.fn = fn
-    def forward(self, q, k, v, **kwargs):
+
+    def construct(self, q, k, v, **kwargs):
         return self.fn(self.norm(q), self.norm(k), self.norm(v), **kwargs) + q
 
-class Attention(nn.Module):
-    def __init__(self, dim, heads = 8, dim_head = 64, dropout = 0.):
+
+class Attention(nn.Cell):
+    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0):
         super().__init__()
-        inner_dim = dim_head *  heads
+        inner_dim = dim_head * heads
         project_out = not (heads == 1 and dim_head == dim)
 
         self.heads = heads
-        self.scale = dim_head ** -0.5
+        self.scale = dim_head**-0.5
 
-        self.attend = nn.Softmax(dim = -1)
-        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias = False)
+        self.attend = nn.Softmax(axis=-1)
+        self.to_qkv = nn.Dense(dim, inner_dim * 3, has_bias=False)
 
-        self.to_out = nn.Sequential(
-            nn.Linear(inner_dim, dim),
-            nn.Dropout(dropout)
-        ) if project_out else nn.Identity()
+        self.to_out = (
+            nn.SequentialCell(nn.Dense(inner_dim, dim), nn.Dropout(p=dropout)) if project_out else nn.Identity()
+        )
 
-    def forward(self, x):
+    def construct(self, x):
         b, n, _, h = *x.shape, self.heads
-        qkv = self.to_qkv(x).chunk(3, dim = -1)
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), qkv)
+        qkv = self.to_qkv(x).chunk(3, axis=-1)
 
-        dots = einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
+        def rearrange_qkv(tensor: ms.Tensor):
+            # b n (h d) -> b n h d -> b h n d
+            tensor = ops.reshape(tensor, (*tensor.shape[:2], h, tensor.shape[2] // h))
+            tensor = ops.transpose(tensor, (0, 2, 1, 3))
+            return tensor
+
+        q, k, v = map(rearrange_qkv, qkv)
+
+        dots = ops.bmm(q, k.transpose(0, 1, 3, 2)) * self.scale
 
         attn = self.attend(dots)
 
-        out = einsum('b h i j, b h j d -> b h i d', attn, v)
-        out = rearrange(out, 'b h n d -> b n (h d)')
+        out = ops.bmm(attn, v)
+        # b h n d -> b n h d -> b n (h d)
+        out = ops.transpose(out, (0, 2, 1, 3))
+        out = ops.reshape(out, (*out.shape[:2], -1))
         return self.to_out(out)
 
 
-class Attention_qkv(nn.Module):
-    def __init__(self, dim, heads = 8, dim_head = 64, dropout = 0.):
+class Attention_qkv(nn.Cell):
+    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0):
         super().__init__()
-        inner_dim = dim_head *  heads
+        inner_dim = dim_head * heads
         project_out = not (heads == 1 and dim_head == dim)
 
         self.heads = heads
-        self.scale = dim_head ** -0.5
+        self.scale = dim_head**-0.5
 
-        self.attend = nn.Softmax(dim = -1)
+        self.attend = nn.Softmax(axis=-1)
         # self.to_qkv = nn.Linear(dim, inner_dim * 3, bias = False)
-        self.to_q = nn.Linear(dim, inner_dim, bias = False)
-        self.to_k = nn.Linear(dim, inner_dim, bias = False)
-        self.to_v = nn.Linear(dim, inner_dim, bias = False)
+        self.to_q = nn.Dense(dim, inner_dim, has_bias=False)
+        self.to_k = nn.Dense(dim, inner_dim, has_bias=False)
+        self.to_v = nn.Dense(dim, inner_dim, has_bias=False)
 
-        self.to_out = nn.Sequential(
-            nn.Linear(inner_dim, dim),
-            nn.Dropout(dropout)
-        ) if project_out else nn.Identity()
+        self.to_out = (
+            nn.SequentialCell(nn.Dense(inner_dim, dim), nn.Dropout(p=dropout)) if project_out else nn.Identity()
+        )
 
-    def forward(self, q, k, v):
+    def construct(self, q, k, v):
         b, n, _, h = *q.shape, self.heads
-        bk = k.shape[0]
         # qkv = self.to_qkv(x).chunk(3, dim = -1)
         q = self.to_q(q)
         k = self.to_k(k)
         v = self.to_v(v)
-        # q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), qkv)
-        q = rearrange(q, 'b n (h d) -> b h n d', h = h)
-        k = rearrange(k, 'b n (h d) -> b h n d', b=bk, h = h)
-        v = rearrange(v, 'b n (h d) -> b h n d', b=bk, h = h)
 
-        dots = einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
+        def rearrange_qkv(tensor: ms.Tensor):
+            # b n (h d) -> b n h d -> b h n d
+            tensor = ops.reshape(tensor, (*tensor.shape[:2], h, tensor.shape[2] // h))
+            tensor = ops.transpose(tensor, (0, 2, 1, 3))
+            return tensor
 
-        attn = self.attend(dots)    # [30, 8, 8, 5]
+        q, k, v = map(rearrange_qkv, (q, k, v))
 
-        out = einsum('b h i j, b h j d -> b h i d', attn, v)
-        out = rearrange(out, 'b h n d -> b n (h d)')
+        dots = ops.bmm(q, k.transpose(0, 1, 3, 2)) * self.scale
+
+        attn = self.attend(dots)  # [30, 8, 8, 5]
+
+        out = ops.bmm(attn, v)
+        # b h n d -> b n h d -> b n (h d)
+        out = ops.transpose(out, (0, 2, 1, 3))
+        out = ops.reshape(out, (*out.shape[:2], -1))
         return self.to_out(out)
 
-class PostNormattention(nn.Module):
+
+class PostNormattention(nn.Cell):
     def __init__(self, dim, fn):
         super().__init__()
         self.norm = nn.LayerNorm(dim)
         self.fn = fn
-    def forward(self, x, **kwargs):
-        return self.norm(self.fn(x, **kwargs) + x)
-    
 
-class Transformer_v2(nn.Module):
-    def __init__(self, heads=8, dim=2048, dim_head_k=256, dim_head_v=256, dropout_atte = 0.05, mlp_dim=2048, dropout_ffn = 0.05, depth=1):
+    def construct(self, x, **kwargs):
+        return self.norm(self.fn(x, **kwargs) + x)
+
+
+class Transformer_v2(nn.Cell):
+    def __init__(
+        self,
+        heads=8,
+        dim=2048,
+        dim_head_k=256,
+        dim_head_v=256,
+        dropout_atte=0.05,
+        mlp_dim=2048,
+        dropout_ffn=0.05,
+        depth=1,
+    ):
         super().__init__()
-        self.layers = nn.ModuleList([])
+        layers = []
         self.depth = depth
         for _ in range(depth):
-            self.layers.append(nn.ModuleList([  # PreNormattention(2048, Attention(2048, heads = 8, dim_head = 256, dropout = 0.2))
-                # PreNormattention(heads, dim, dim_head_k, dim_head_v, dropout=dropout_atte),
-                PreNormattention(dim, Attention(dim, heads = heads, dim_head = dim_head_k, dropout = dropout_atte)),
-                FeedForward(dim, mlp_dim, dropout = dropout_ffn),
-            ]))
-    def forward(self, x):
+            layers.append(
+                nn.CellList(
+                    [
+                        # PreNormattention(2048, Attention(2048, heads = 8, dim_head = 256, dropout = 0.2))
+                        # PreNormattention(heads, dim, dim_head_k, dim_head_v, dropout=dropout_atte),
+                        PreNormattention(dim, Attention(dim, heads=heads, dim_head=dim_head_k, dropout=dropout_atte)),
+                        FeedForward(dim, mlp_dim, dropout=dropout_ffn),
+                    ]
+                )
+            )
+        self.layers = nn.CellList(layers)
+
+    def construct(self, x):
         # if self.depth
         for attn, ff in self.layers[:1]:
             x = attn(x)
@@ -1831,49 +2213,50 @@ class Transformer_v2(nn.Module):
         return x
 
 
-class DropPath(nn.Module):
-    r"""DropPath but without rescaling and supports optional all-zero and/or all-keep.
-    """
+class DropPath(nn.Cell):
+    r"""DropPath but without rescaling and supports optional all-zero and/or all-keep."""
+
     def __init__(self, p):
         super(DropPath, self).__init__()
         self.p = p
-    
-    def forward(self, *args, zero=None, keep=None):
+
+    def construct(self, *args, zero=None, keep=None):
         if not self.training:
             return args[0] if len(args) == 1 else args
-        
+
         # params
         x = args[0]
-        b = x.size(0)
-        n = (torch.rand(b) < self.p).sum()
+        b = x.shape[0]
+        n = (ops.rand(b) < self.p).sum()
 
         # non-zero and non-keep mask
-        mask = x.new_ones(b, dtype=torch.bool)
+        mask = x.new_ones(b, dtype=ms.bool_)
         if keep is not None:
             mask[keep] = False
         if zero is not None:
             mask[zero] = False
-        
+
         # drop-path index
-        index = torch.where(mask)[0]
-        index = index[torch.randperm(len(index))[:n]]
+        index = ops.nonzero(mask).t()[0]  # special case for ops.nonzero, that the input is 1-d tensor
+        index = index[ops.randperm(len(index))[:n]]
         if zero is not None:
-            index = torch.cat([index, torch.where(zero)[0]], dim=0)
-        
+            index = ops.cat([index, ops.nonzero(zero).t()[0]], axis=0)
+
         # drop-path multiplier
         multiplier = x.new_ones(b)
         multiplier[index] = 0.0
         output = tuple(u * self.broadcast(multiplier, u) for u in args)
         return output[0] if len(args) == 1 else output
-    
+
     def broadcast(self, src, dst):
-        assert src.size(0) == dst.size(0)
-        shape = (dst.size(0), ) + (1, ) * (dst.ndim - 1)
+        assert src.shape[0] == dst.shape[0]
+        shape = (dst.shape[0],) + (1,) * (dst.ndim - 1)
         return src.view(shape)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     from config import cfg
+
     # [model] unet
     model = UNetSD_temporal(
         in_dim=cfg.unet_in_dim,
@@ -1887,11 +2270,10 @@ if __name__ == '__main__':
         num_res_blocks=cfg.unet_res_blocks,
         attn_scales=cfg.unet_attn_scales,
         dropout=cfg.unet_dropout,
-        temporal_attn_times = 0,
+        temporal_attn_times=0,
         use_checkpoint=cfg.use_checkpoint,
         use_image_dataset=True,
-        use_fps_condition=cfg.use_fps_condition)#.to(gpu)
+        use_fps_condition=cfg.use_fps_condition,
+    )  # .to(gpu)
 
-    print(int(sum(p.numel() for k, p in model.named_parameters()) / (1024 ** 2)), 'M parameters')
-
-    
+    print(int(sum(p.numel() for k, p in model.named_parameters()) / (1024**2)), "M parameters")
