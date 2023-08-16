@@ -2,20 +2,24 @@ r"""Modified from ``https://github.com/sergeyk/rayleigh''.
 """
 import os
 import os.path as osp
+
 import numpy as np
-from skimage.color import hsv2rgb, rgb2lab, lab2rgb
+from skimage.color import hsv2rgb, lab2rgb, rgb2lab
 from skimage.io import imsave
 from sklearn.metrics import euclidean_distances
 
-__all__ = ['Palette']
+__all__ = ["Palette"]
+
 
 def rgb2hex(rgb):
-    return '#%02x%02x%02x' % tuple([int(round(255.0 * u)) for u in rgb])
+    return "#%02x%02x%02x" % tuple([int(round(255.0 * u)) for u in rgb])
+
 
 def hex2rgb(hex):
-    rgb = hex.strip('#')
+    rgb = hex.strip("#")
     fn = lambda u: round(int(u, 16) / 255.0, 5)
     return fn(rgb[:2]), fn(rgb[2:4]), fn(rgb[4:6])
+
 
 class Palette(object):
     r"""Create a color palette (codebook) in the form of a 2D grid of colors.
@@ -25,35 +29,30 @@ class Palette(object):
         num_hues: number of colors with full lightness and saturation, in the middle.
         num_sat: number of rows above middle row that show the same hues with decreasing saturation.
     """
+
     def __init__(self, num_hues=11, num_sat=5, num_light=4):
         n = num_sat + 2 * num_light
 
         # hues
         if num_hues == 8:
-            hues = np.tile(np.array([0.,  0.10,  0.15,  0.28, 0.51, 0.58, 0.77,  0.85]), (n, 1))
+            hues = np.tile(np.array([0.0, 0.10, 0.15, 0.28, 0.51, 0.58, 0.77, 0.85]), (n, 1))
         elif num_hues == 9:
-            hues = np.tile(np.array([0.,  0.10,  0.15,  0.28, 0.49, 0.54, 0.60, 0.7, 0.87]), (n, 1))
+            hues = np.tile(np.array([0.0, 0.10, 0.15, 0.28, 0.49, 0.54, 0.60, 0.7, 0.87]), (n, 1))
         elif num_hues == 10:
-            hues = np.tile(np.array([0.,  0.10,  0.15,  0.28, 0.49, 0.54, 0.60, 0.66, 0.76, 0.87]), (n, 1))
+            hues = np.tile(np.array([0.0, 0.10, 0.15, 0.28, 0.49, 0.54, 0.60, 0.66, 0.76, 0.87]), (n, 1))
         elif num_hues == 11:
             hues = np.tile(np.array([0.0, 0.0833, 0.166, 0.25, 0.333, 0.5, 0.56333, 0.666, 0.73, 0.803, 0.916]), (n, 1))
         else:
             hues = np.tile(np.linspace(0, 1, num_hues + 1)[:-1], (n, 1))
-        
+
         # saturations
-        sats = np.hstack((
-            np.linspace(0, 1, num_sat + 2)[1:-1],
-            1,
-            [1] * num_light,
-            [0.4] * (num_light - 1)))
+        sats = np.hstack((np.linspace(0, 1, num_sat + 2)[1:-1], 1, [1] * num_light, [0.4] * (num_light - 1)))
         sats = np.tile(np.atleast_2d(sats).T, (1, num_hues))
 
         # lights
-        lights = np.hstack((
-            [1] * num_sat,
-            1,
-            np.linspace(1, 0.2, num_light + 2)[1:-1],
-            np.linspace(1, 0.2, num_light + 2)[1:-2]))
+        lights = np.hstack(
+            ([1] * num_sat, 1, np.linspace(1, 0.2, num_light + 2)[1:-1], np.linspace(1, 0.2, num_light + 2)[1:-2])
+        )
         lights = np.tile(np.atleast_2d(lights).T, (1, num_hues))
 
         # colors
@@ -68,7 +67,7 @@ class Palette(object):
         self.lab = rgb2lab(self.rgb[np.newaxis, :, :]).squeeze()
         self.hex = [rgb2hex(u) for u in self.rgb]
         self.lab_dists = euclidean_distances(self.lab, squared=True)
-    
+
     def histogram(self, rgb_img, sigma=20):
         # compute histogram
         lab = rgb2lab(rgb_img).reshape((-1, 3))
@@ -77,12 +76,12 @@ class Palette(object):
 
         # smooth histogram
         if sigma > 0:
-            weight = np.exp(-self.lab_dists / (2.0 * sigma ** 2))
+            weight = np.exp(-self.lab_dists / (2.0 * sigma**2))
             weight = weight / weight.sum(1)[:, np.newaxis]
             hist = (weight * hist).sum(1)
             hist[hist < 1e-5] = 0
         return hist
-    
+
     def get_palette_image(self, hist, percentile=90, width=200, height=50):
         # curate histogram
         ind = np.argsort(-hist)
@@ -103,17 +102,17 @@ class Palette(object):
         quantized_lab = self.lab[min_ind]
         img = lab2rgb(quantized_lab.reshape(rgb_img.shape))
         return img
-    
+
     def export(self, dirname):
         if not osp.exists(dirname):
             os.makedirs(dirname)
-        
+
         # save thumbnail
-        imsave(osp.join(dirname, 'palette.png'), self.thumbnail)
+        imsave(osp.join(dirname, "palette.png"), self.thumbnail)
 
         # save html
-        with open(osp.join(dirname, 'palette.html'), 'w') as f:
-            html = '''
+        with open(osp.join(dirname, "palette.html"), "w") as f:
+            html = """
             <style>
                 span {
                     width: 20px;
@@ -123,9 +122,9 @@ class Palette(object):
                     display: inline-block;
                 }
             </style>
-            '''
+            """
             for row in self.thumbnail:
                 for col in row:
                     html += '<a id="{0}"><span style="background-color: {0}" /></a>\n'.format(rgb2hex(col))
-                html += '<br />\n'
+                html += "<br />\n"
             f.write(html)

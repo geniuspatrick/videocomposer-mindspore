@@ -1,22 +1,14 @@
-import os
-import os.path as osp
-import sys
-
-# append parent path to environment
-sys.path.insert(0, "/".join(osp.realpath(__file__).split("/")[:-4]))
-import itertools
-import json
 import logging
 import math
+import os
+import os.path as osp
 import random
-from collections import defaultdict
+import sys
 from copy import copy, deepcopy
 from functools import partial
 from importlib import reload
-from io import BytesIO
 
 import numpy as np
-from easydict import EasyDict
 from PIL import Image
 
 import mindspore as ms
@@ -25,17 +17,11 @@ from mindspore import nn
 from mindspore.dataset import transforms, vision
 from mindspore.dataset.vision import Inter as InterpolationMode
 
-import artist.data as data
-import artist.models as models
 import artist.ops as ops
-from artist import DOWNLOAD_TO_CACHE
-from artist.models.clip import VisionTransformer
-from artist.optim import Adafactor, AnnealingLR
 from tools.annotator.canny import CannyDetector
+from tools.annotator.depth import midas_v3
 from tools.annotator.sketch import pidinet_bsd, sketch_simplification_gan
-
-# from tools.annotator.histogram import Palette
-from utils.config import Config
+from utils import DOWNLOAD_TO_CACHE
 
 from .autoencoder import AutoencoderKL, DiagonalGaussianDistribution
 from .config import cfg
@@ -413,15 +399,15 @@ def worker(gpu, cfg):
     cfg.batch_size = cfg.batch_sizes[str(cfg.max_frames)]
 
     # [Transformer] Transformers for different inputs
-    infer_trans = data.Compose(
-        [data.CenterCropV2(size=cfg.resolution), data.ToTensor(), data.Normalize(mean=cfg.mean, std=cfg.std)]
+    infer_trans = transforms.Compose(
+        [vision.CenterCrop(size=cfg.resolution), vision.ToTensor(), vision.Normalize(mean=cfg.mean, std=cfg.std)]
     )
 
-    misc_transforms = data.Compose(
-        [partial(random_resize, size=cfg.misc_size), data.CenterCropV2(cfg.misc_size), data.ToTensor()]
+    misc_transforms = transforms.Compose(
+        [partial(random_resize, size=cfg.misc_size), vision.CenterCrop(cfg.misc_size), vision.ToTensor()]
     )
 
-    mv_transforms = data.Compose([vision.Resize(size=cfg.resolution), vision.CenterCrop(cfg.resolution)])
+    mv_transforms = transforms.Compose([vision.Resize(size=cfg.resolution), vision.CenterCrop(cfg.resolution)])
 
     dataset = VideoDataset(
         cfg=cfg,
@@ -452,7 +438,7 @@ def worker(gpu, cfg):
 
     # [Contions] Generators for various conditions
     if "depthmap" in cfg.video_compositions:
-        midas = models.midas_v3(pretrained=True).eval().requires_grad_(False).half()
+        midas = midas_v3(pretrained=True).eval().requires_grad_(False).half()
     if "canny" in cfg.video_compositions:
         canny_detector = CannyDetector()
     if "sketch" in cfg.video_compositions:
