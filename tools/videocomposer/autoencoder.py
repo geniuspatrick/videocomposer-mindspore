@@ -5,7 +5,7 @@ import numpy as np
 import mindspore as ms
 from mindspore import nn, ops
 
-__all__ = ["AutoencoderKL"]
+__all__ = ["DiagonalGaussianDistribution", "AutoencoderKL"]
 
 
 def nonlinearity(x):

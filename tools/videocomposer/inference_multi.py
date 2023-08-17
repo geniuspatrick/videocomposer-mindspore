@@ -1,335 +1,36 @@
 import logging
-import math
 import os
 import os.path as osp
-import random
 import sys
 from copy import copy, deepcopy
 from functools import partial
 from importlib import reload
 
-import numpy as np
-from PIL import Image
-
 import mindspore as ms
 from mindspore import dataset as ds
-from mindspore import nn
 from mindspore.dataset import transforms, vision
-from mindspore.dataset.vision import Inter as InterpolationMode
 
-import artist.ops as ops
+from artist.ops.diffusion import GaussianDiffusion
+from artist.ops.utils import save_video_multiple_conditions
 from tools.annotator.canny import CannyDetector
 from tools.annotator.depth import midas_v3
 from tools.annotator.sketch import pidinet_bsd, sketch_simplification_gan
 from utils import DOWNLOAD_TO_CACHE
 
-from .autoencoder import AutoencoderKL, DiagonalGaussianDistribution
+from .autoencoder import AutoencoderKL
 from .config import cfg
 from .datasets import VideoDataset
+from .inference import (
+    CenterCrop,
+    FrozenOpenCLIPEmbedder,
+    FrozenOpenCLIPVisualEmbedder,
+    beta_schedule,
+    get_first_stage_encoding,
+    make_masked_images,
+    random_resize,
+    setup_seed,
+)
 from .unet_sd import UNetSD_temporal
-
-
-def beta_schedule(schedule, num_timesteps=1000, init_beta=None, last_beta=None):
-    """
-    This code defines a function beta_schedule that generates a sequence of beta values based on the given input parameters. These beta values can be used in video diffusion processes. The function has the following parameters:
-        schedule(str): Determines the type of beta schedule to be generated. It can be 'linear', 'linear_sd', 'quadratic', or 'cosine'.
-        num_timesteps(int, optional): The number of timesteps for the generated beta schedule. Default is 1000.
-        init_beta(float, optional): The initial beta value. If not provided, a default value is used based on the chosen schedule.
-        last_beta(float, optional): The final beta value. If not provided, a default value is used based on the chosen schedule.
-    The function returns a PyTorch tensor containing the generated beta values. The beta schedule is determined by the schedule parameter:
-        1.Linear: Generates a linear sequence of beta values betweeninit_betaandlast_beta.
-        2.Linear_sd: Generates a linear sequence of beta values between the square root of init_beta and the square root oflast_beta, and then squares the result.
-        3.Quadratic: Similar to the 'linear_sd' schedule, but with different default values forinit_betaandlast_beta.
-        4.Cosine: Generates a sequence of beta values based on a cosine function, ensuring the values are between 0 and 0.999.
-    If an unsupported schedule is provided, a ValueError is raised with a message indicating the issue.
-    """
-    if schedule == "linear":
-        scale = 1000.0 / num_timesteps
-        init_beta = init_beta or scale * 0.0001
-        last_beta = last_beta or scale * 0.02
-        return ms.ops.linspace(init_beta, last_beta, num_timesteps).to(ms.float64)
-    elif schedule == "linear_sd":
-        return ms.ops.linspace(init_beta**0.5, last_beta**0.5, num_timesteps).to(ms.float64) ** 2
-    elif schedule == "quadratic":
-        init_beta = init_beta or 0.0015
-        last_beta = last_beta or 0.0195
-        return ms.ops.linspace(init_beta**0.5, last_beta**0.5, num_timesteps).to(ms.float64) ** 2
-    elif schedule == "cosine":
-        betas = []
-        for step in range(num_timesteps):
-            t1 = step / num_timesteps
-            t2 = (step + 1) / num_timesteps
-            fn = lambda u: math.cos((u + 0.008) / 1.008 * math.pi / 2) ** 2
-            betas.append(min(1.0 - fn(t2) / fn(t1), 0.999))
-        return ms.Tensor(betas, dtype=ms.float64)
-    else:
-        raise ValueError(f"Unsupported schedule: {schedule}")
-
-
-class FrozenOpenCLIPEmbedder(nn.Cell):
-    """
-    Uses the OpenCLIP transformer encoder for text
-    """
-
-    LAYERS = [
-        # "pooled",
-        "last",
-        "penultimate",
-    ]
-
-    def __init__(
-        self, arch="ViT-H-14", pretrained="laion2b_s32b_b79k", device="cuda", max_length=77, freeze=True, layer="last"
-    ):
-        super().__init__()
-        assert layer in self.LAYERS
-        #
-        model, _, _ = open_clip.create_model_and_transforms(arch, pretrained=pretrained)
-        #
-        del model.visual
-        self.model = model
-
-        self.device = device
-        self.max_length = max_length
-        if freeze:
-            self.freeze()
-        self.layer = layer
-        if self.layer == "last":
-            self.layer_idx = 0
-        elif self.layer == "penultimate":
-            self.layer_idx = 1
-        else:
-            raise NotImplementedError()
-
-    def freeze(self):
-        self.model = self.model.set_train(False)
-        for param in self.parameters():
-            param.requires_grad = False
-
-    def construct(self, text):
-        tokens = open_clip.tokenize(text)
-        z = self.encode_with_transformer(tokens)
-        return z
-
-    def encode_with_transformer(self, text):
-        x = self.model.token_embedding(text)  # [batch_size, n_ctx, d_model]
-        x = x + self.model.positional_embedding
-        x = x.transpose(1, 0, 2)  # NLD -> LND
-        x = self.text_transformer_forward(x, attn_mask=self.model.attn_mask)
-        x = x.transpose(1, 0, 2)  # LND -> NLD
-        x = self.model.ln_final(x)
-        return x
-
-    def text_transformer_forward(self, x: ms.Tensor, attn_mask=None):
-        for i, r in enumerate(self.model.transformer.resblocks):
-            if i == len(self.model.transformer.resblocks) - self.layer_idx:
-                break
-            if self.model.transformer.grad_checkpointing:
-                # x = checkpoint(r, x, attn_mask)
-                raise NotImplementedError("Gradiant checkpointing is not supported for now!")
-            else:
-                x = r(x, attn_mask=attn_mask)
-        return x
-
-    def encode(self, text):
-        return self(text)
-
-
-def load_stable_diffusion_pretrained(state_dict, temporal_attention):
-    import collections
-
-    sd_new = collections.OrderedDict()
-    keys = list(state_dict.keys())
-
-    # "input_blocks.3.op.weight", "input_blocks.3.op.bias", "input_blocks.6.op.weight", "input_blocks.6.op.bias", "input_blocks.9.op.weight", "input_blocks.9.op.bias".
-    # "input_blocks.3.0.op.weight", "input_blocks.3.0.op.bias", "input_blocks.6.0.op.weight", "input_blocks.6.0.op.bias", "input_blocks.9.0.op.weight", "input_blocks.9.0.op.bias".
-    for k in keys:
-        if k.find("diffusion_model") >= 0:
-            k_new = k.split("diffusion_model.")[-1]
-            if k_new in [
-                "input_blocks.3.0.op.weight",
-                "input_blocks.3.0.op.bias",
-                "input_blocks.6.0.op.weight",
-                "input_blocks.6.0.op.bias",
-                "input_blocks.9.0.op.weight",
-                "input_blocks.9.0.op.bias",
-            ]:
-                k_new = k_new.replace("0.op", "op")
-            if temporal_attention:
-                if k_new.find("middle_block.2") >= 0:
-                    k_new = k_new.replace("middle_block.2", "middle_block.3")
-                if k_new.find("output_blocks.5.2") >= 0:
-                    k_new = k_new.replace("output_blocks.5.2", "output_blocks.5.3")
-                if k_new.find("output_blocks.8.2") >= 0:
-                    k_new = k_new.replace("output_blocks.8.2", "output_blocks.8.3")
-            sd_new[k_new] = state_dict[k]
-
-    return sd_new
-
-
-def random_resize(img, size):
-    img = [
-        vision.Resize(
-            size,
-            interpolation=random.choice(
-                [InterpolationMode.BILINEAR, InterpolationMode.BICUBIC, InterpolationMode.ANTIALIAS]
-            ),
-        )(u)
-        for u in img
-    ]
-    return img
-
-
-class CenterCrop(object):
-    def __init__(self, size):
-        self.size = size
-
-    def __call__(self, img):
-        # fast resize
-        while min(img.size) >= 2 * self.size:
-            img = img.resize((img.width // 2, img.height // 2), resample=Image.BOX)
-        scale = self.size / min(img.size)
-        img = img.resize((round(scale * img.width), round(scale * img.height)), resample=Image.BICUBIC)
-
-        # center crop
-        x1 = (img.width - self.size) // 2
-        y1 = (img.height - self.size) // 2
-        img = img.crop((x1, y1, x1 + self.size, y1 + self.size))
-        return img
-
-
-class AddGaussianNoise(object):
-    def __init__(self, mean=0.0, std=0.1):
-        self.std = std
-        self.mean = mean
-
-    def __call__(self, img):
-        assert isinstance(img, ms.Tensor)
-        dtype = img.dtype
-        if not img.is_floating_point():
-            img = img.to(ms.float32)
-        out = img + self.std * ms.ops.randn_like(img) + self.mean
-        if out.dtype != dtype:
-            out = out.to(dtype)
-        return out
-
-    def __repr__(self):
-        return self.__class__.__name__ + "(mean={0}, std={1})".format(self.mean, self.std)
-
-
-def make_masked_images(imgs, masks):
-    masked_imgs = []
-    for i, mask in enumerate(masks):
-        # concatenation
-        masked_imgs.append(ms.ops.cat([imgs[i] * (1 - mask), (1 - mask)], axis=1))
-    return ms.ops.stack(masked_imgs, axis=0)
-
-
-# @torch.no_grad()
-def get_first_stage_encoding(encoder_posterior):
-    scale_factor = 0.18215
-    if isinstance(encoder_posterior, DiagonalGaussianDistribution):
-        z = encoder_posterior.sample()
-    elif isinstance(encoder_posterior, ms.Tensor):
-        z = encoder_posterior
-    else:
-        raise NotImplementedError(f"encoder_posterior of type '{type(encoder_posterior)}' not yet implemented")
-    return scale_factor * z
-
-
-class FrozenOpenCLIPVisualEmbedder(nn.Cell):
-    """
-    Uses the OpenCLIP transformer encoder for text
-    """
-
-    LAYERS = [
-        # "pooled",
-        "last",
-        "penultimate",
-    ]
-
-    def __init__(
-        self,
-        arch="ViT-H-14",
-        pretrained="laion2b_s32b_b79k",
-        device="cuda",
-        max_length=77,
-        freeze=True,
-        layer="last",
-        input_shape=(224, 224, 3),
-    ):
-        super().__init__()
-        assert layer in self.LAYERS
-        # version = 'cache/open_clip_pytorch_model.bin'
-        model, _, preprocess = open_clip.create_model_and_transforms(
-            arch, pretrained=pretrained
-        )  # '/mnt/workspace/videocomposer/VideoComposer_diffusion/cache/open_clip_pytorch_model.bin'
-        # model, _, _ = open_clip.create_model_and_transforms(arch, device=device, pretrained=version)
-        del model.transformer
-        self.model = model
-        data_white = np.ones(input_shape, dtype=np.uint8) * 255
-        self.black_image = preprocess(vision.ToPIL()(data_white)).unsqueeze(0)
-
-        self.device = device
-        self.max_length = max_length  # 77
-        if freeze:
-            self.freeze()
-        self.layer = layer  # 'penultimate'
-        if self.layer == "last":
-            self.layer_idx = 0
-        elif self.layer == "penultimate":
-            self.layer_idx = 1
-        else:
-            raise NotImplementedError()
-
-    def freeze(self):
-        self.model = self.model.set_train(False)
-        for param in self.parameters():
-            param.requires_grad = False
-
-    def construct(self, image):
-        # tokens = open_clip.tokenize(text)
-        z = self.model.encode_image(image)
-        return z
-
-    def encode_with_transformer(self, text):
-        x = self.model.token_embedding(text)  # [batch_size, n_ctx, d_model]
-        x = x + self.model.positional_embedding
-        x = x.transpose(1, 0, 2)  # NLD -> LND
-        x = self.text_transformer_forward(x, attn_mask=self.model.attn_mask)
-        x = x.transpose(1, 0, 2)  # LND -> NLD
-        x = self.model.ln_final(x)
-        return x
-
-    def text_transformer_forward(self, x: ms.Tensor, attn_mask=None):
-        for i, r in enumerate(self.model.transformer.resblocks):
-            if i == len(self.model.transformer.resblocks) - self.layer_idx:
-                break
-            if self.model.transformer.grad_checkpointing:
-                # x = checkpoint(r, x, attn_mask)
-                raise NotImplementedError("Gradiant checkpointing is not supported for now!")
-            else:
-                x = r(x, attn_mask=attn_mask)
-        return x
-
-    def encode(self, text):
-        return self(text)
-
-
-def find_free_port():
-    """https://stackoverflow.com/questions/1365265/on-localhost-how-do-i-pick-a-free-port-number"""
-    import socket
-    from contextlib import closing
-
-    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
-        s.bind(("", 0))
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        return str(s.getsockname()[1])
-
-
-def setup_seed(seed):
-    ms.set_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
 
 
 def inference_multi(cfg_update, **kwargs):
@@ -339,44 +40,50 @@ def inference_multi(cfg_update, **kwargs):
     for k, v in cfg_update.items():
         cfg[k] = v
 
-    if not "MASTER_ADDR" in os.environ:
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = find_free_port()
-    cfg.pmi_rank = int(os.getenv("RANK", 0))  # 0
-    cfg.pmi_world_size = int(os.getenv("WORLD_SIZE", 1))
+    cfg.pmi_rank = int(os.getenv("RANK", 0))  # rank_of_node?
+    cfg.pmi_world_size = int(os.getenv("WORLD_SIZE", 1))  # n_nodes?
     setup_seed(cfg.seed)
 
     if cfg.debug:
         cfg.gpus_per_machine = 1
         cfg.world_size = 1
     else:
+        # LOCAL_WORLD_SIZE - The local world size (e.g. number of workers running locally); (nproc-per-node)
         cfg.gpus_per_machine = ms.communication.get_group_size()
+        # WORLD_SIZE - The world size (total number of workers in the job).
         cfg.world_size = cfg.pmi_world_size * cfg.gpus_per_machine
 
     if cfg.world_size == 1:
         worker(0, cfg)
     else:
         # mp.spawn(worker, nprocs=cfg.gpus_per_machine, args=(cfg,))
-        worker(cfg.gpus_per_machine, cfg)
+        raise NotImplementedError("Distributed inference is not supported yet!")
     return cfg
 
 
 def worker(gpu, cfg):
+    # LOCAL_RANK - The local rank.
     cfg.gpu = gpu
+    # RANK - The global rank.
     cfg.rank = cfg.pmi_rank * cfg.gpus_per_machine + gpu
 
-    # init distributed processes
-    ms.communication.init()
-    rank_id, device_num = ms.communication.get_rank(), ms.communication.get_group_size()
-    ms.set_auto_parallel_context(
-        device_num=device_num,
-        parallel_mode="data_parallel",
-        gradients_mean=True,
-    )
+    if cfg.world_size > 1:
+        # init distributed processes
+        ms.communication.init()
+        rank_id, device_num = ms.communication.get_rank(), ms.communication.get_group_size()
+        ms.set_auto_parallel_context(
+            device_num=device_num,
+            parallel_mode="data_parallel",
+            gradients_mean=True,
+        )
+    else:
+        rank_id, device_num = 0, 1
+    assert rank_id == cfg.rank and device_num == cfg.world_size
 
     # logging
     input_video_name = os.path.basename(cfg.input_video).split(".")[0]
-    log_dir = ops.generalized_all_gather(cfg.log_dir)[0]
+    # todo: need `all_gather` to get consistent `log_dir` between each proc if running in distributed mode.
+    log_dir = cfg.log_dir
     exp_name = os.path.basename(cfg.cfg_file).split(".")[0] + f"-{input_video_name}" + "-S%05d" % (cfg.seed)
     log_dir = os.path.join(log_dir, exp_name)
     os.makedirs(log_dir, exist_ok=True)
@@ -398,16 +105,17 @@ def worker(gpu, cfg):
     cfg.max_frames = cfg.frame_lens[cfg.rank % (l1 * l2) // l2]
     cfg.batch_size = cfg.batch_sizes[str(cfg.max_frames)]
 
-    # [Transformer] Transformers for different inputs
-    infer_trans = transforms.Compose(
+    # [Transform] Transforms for different inputs
+    infer_transforms = transforms.Compose(
         [vision.CenterCrop(size=cfg.resolution), vision.ToTensor(), vision.Normalize(mean=cfg.mean, std=cfg.std)]
     )
-
     misc_transforms = transforms.Compose(
         [partial(random_resize, size=cfg.misc_size), vision.CenterCrop(cfg.misc_size), vision.ToTensor()]
     )
-
     mv_transforms = transforms.Compose([vision.Resize(size=cfg.resolution), vision.CenterCrop(cfg.resolution)])
+    vit_transforms = transforms.Compose(
+        [CenterCrop(cfg.vit_image_size), vision.ToTensor(), vision.Normalize(mean=cfg.vit_mean, std=cfg.vit_std)]
+    )
 
     dataset = VideoDataset(
         cfg=cfg,
@@ -415,12 +123,10 @@ def worker(gpu, cfg):
         feature_framerate=cfg.feature_framerate,
         max_frames=cfg.max_frames,
         image_resolution=cfg.resolution,
-        transforms=infer_trans,
+        transforms=infer_transforms,
         mv_transforms=mv_transforms,
         misc_transforms=misc_transforms,
-        vit_transforms=transforms.Compose(
-            [CenterCrop(cfg.vit_image_size), vision.ToTensor(), vision.Normalize(mean=cfg.vit_mean, std=cfg.vit_std)]
-        ),
+        vit_transforms=vit_transforms,
         vit_image_size=cfg.vit_image_size,
         misc_size=cfg.misc_size,
     )
@@ -436,20 +142,20 @@ def worker(gpu, cfg):
     black_image_feature = clip_encoder_visual(clip_encoder_visual.black_image).unsqueeze(1)  # [1, 1, 1024]
     black_image_feature = ms.ops.zeros_like(black_image_feature)  # for old
 
-    # [Contions] Generators for various conditions
+    # [Conditions] Generators for various conditions
     if "depthmap" in cfg.video_compositions:
-        midas = midas_v3(pretrained=True).eval().requires_grad_(False).half()
+        midas = midas_v3(pretrained=True).set_train(False).to_float(ms.float16)
     if "canny" in cfg.video_compositions:
         canny_detector = CannyDetector()
     if "sketch" in cfg.video_compositions:
-        pidinet = pidinet_bsd(pretrained=True, vanilla_cnn=True).eval().requires_grad_(False)
-        cleaner = sketch_simplification_gan(pretrained=True).eval().requires_grad_(False)
+        pidinet = pidinet_bsd(pretrained=True, vanilla_cnn=True).set_train(False)
+        cleaner = sketch_simplification_gan(pretrained=True).set_train(False)
         pidi_mean = ms.Tensor(cfg.sketch_mean).view(1, -1, 1, 1)
         pidi_std = ms.Tensor(cfg.sketch_std).view(1, -1, 1, 1)
     # Placeholder for color inference
     palette = None
 
-    # [model] auotoencoder
+    # [Model] autoencoder
     ddconfig = {
         "double_z": True,
         "z_channels": 4,
@@ -464,7 +170,7 @@ def worker(gpu, cfg):
     }
     autoencoder = AutoencoderKL(ddconfig, 4, ckpt_path=DOWNLOAD_TO_CACHE(cfg.sd_checkpoint))
     autoencoder.set_train(False)
-    for param in autoencoder.parameters():
+    for param in autoencoder.get_parameters():
         param.requires_grad = False
 
     if hasattr(cfg, "network_name") and cfg.network_name == "UNetSD_temporal":
@@ -523,32 +229,31 @@ def worker(gpu, cfg):
 
     # diffusion
     betas = beta_schedule("linear_sd", cfg.num_timesteps, init_beta=0.00085, last_beta=0.0120)
-    diffusion = ops.GaussianDiffusion(
+    diffusion = GaussianDiffusion(
         betas=betas, mean_type=cfg.mean_type, var_type=cfg.var_type, loss_type=cfg.loss_type, rescale_timesteps=False
     )
 
     # global variables
     viz_num = cfg.batch_size
-    for step, batch in enumerate(dataloader):
+    for step, batch in enumerate(dataloader.create_tuple_iterator()):
         model.set_train(False)
 
         caps = batch[1]
         del batch[1]
-        batch = ops.to_device(batch, gpu, non_blocking=True)
         if cfg.max_frames == 1 and cfg.use_image_dataset:
             ref_imgs, video_data, misc_data, mask, mv_data = batch
             fps = ms.Tensor([cfg.feature_framerate] * cfg.batch_size, dtype=ms.int64)
         else:
             ref_imgs, video_data, misc_data, fps, mask, mv_data = batch
 
-        ### save for visualization
+        # save for visualization
         misc_backups = copy(misc_data)
         misc_backups = ms.ops.transpose(misc_backups, (0, 2, 1, 3, 4))
         mv_data_video = []
         if "motion" in cfg.video_compositions:
             mv_data_video = ms.ops.transpose(mv_data, (0, 2, 1, 3, 4))
 
-        ### mask images
+        # mask images
         masked_video = []
         if "mask" in cfg.video_compositions:
             masked_video = make_masked_images(misc_data.sub(0.5).div_(0.5), mask)
@@ -561,14 +266,13 @@ def worker(gpu, cfg):
             image_local = misc_data[:, :1].copy().tile((1, frames_num, 1, 1, 1))
             image_local = ms.ops.transpose(image_local, (0, 2, 1, 3, 4))
 
-        ### encode the video_data
+        # encode the video_data
         bs_vd = video_data.shape[0]
         video_data_origin = video_data.copy()
         b, f, c, h, w = video_data.shape
         video_data = ms.ops.reshape(video_data, (b * f, c, h, w))
         b, f, c, h, w = misc_data.shape
         misc_data = ms.ops.transpose(misc_data, (b * f, c, h, w))
-        # video_data_origin = video_data.clone()
 
         video_data_list = ms.ops.chunk(video_data, video_data.shape[0] // cfg.chunk_size, axis=0)
         misc_data_list = ms.ops.chunk(misc_data, misc_data.shape[0] // cfg.chunk_size, axis=0)
@@ -629,7 +333,7 @@ def worker(gpu, cfg):
         # with torch.no_grad() end
 
         # preprocess for input text descripts
-        y = clip_encoder(caps).detach()  # [1, 77, 1024]
+        y = clip_encoder(caps)  # [1, 77, 1024]
         y0 = y.copy()
 
         y_visual = []
@@ -942,9 +646,7 @@ def visualize_with_model_kwargs(
     try:
         del model_kwargs[0][list(model_kwargs[0].keys())[0]]
         del model_kwargs[1][list(model_kwargs[1].keys())[0]]
-        ops.save_video_multiple_conditions(
-            oss_key, video_data, model_kwargs, ori_video, palette, cfg.mean, cfg.std, nrow=1
-        )
+        save_video_multiple_conditions(oss_key, video_data, model_kwargs, ori_video, palette, cfg.mean, cfg.std, nrow=1)
         if cfg.rank == 0:
             texts = "\n".join(caps[:viz_num])
             open(text_key, "w").writelines(texts)

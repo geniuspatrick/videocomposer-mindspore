@@ -434,8 +434,8 @@ class PiDiNet(nn.Cell):
         return outputs[-1]
 
 
-def pidinet_bsd(pretrained=False, ckpt_path=None):
-    vanilla_cnn = True
+def pidinet_bsd(pretrained=False, ckpt_path=None, vanilla_cnn=True):
+    assert vanilla_cnn is True, "vanilla_cnn only support True for now!"
     pdcs = config_model_converted("carv4")
     model = PiDiNet(60, pdcs, dil=24, sa=True, convert=vanilla_cnn)
 
