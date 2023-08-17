@@ -1,5 +1,6 @@
 import math
 import random
+from typing import Optional
 
 import numpy as np
 from PIL import Image
@@ -9,6 +10,7 @@ from mindspore import nn, ops
 from mindspore.dataset import vision
 from mindspore.dataset.vision import Inter as InterpolationMode
 
+from ..clip import CLIPImageProcessor, CLIPModel, CLIPTokenizer, parse, support_list
 from .autoencoder import DiagonalGaussianDistribution
 
 
@@ -119,138 +121,164 @@ def get_first_stage_encoding(encoder_posterior):
     return scale_factor * z
 
 
-class FrozenOpenCLIPEmbedder(nn.Cell):
-    """
-    Uses the OpenCLIP transformer encoder for text
-    """
-
-    LAYERS = [
-        # "pooled",
-        "last",
-        "penultimate",
-    ]
-
-    def __init__(self, arch="ViT-H-14", pretrained="laion2b_s32b_b79k", max_length=77, freeze=True, layer="last"):
-        super().__init__()
-        assert layer in self.LAYERS
-
-        model, _, _ = open_clip.create_model_and_transforms(arch, pretrained=pretrained)
-        del model.visual
-        self.model = model
-
-        self.max_length = max_length
-        if freeze:
-            self.freeze()
-        self.layer = layer
-        if self.layer == "last":
-            self.layer_idx = 0
-        elif self.layer == "penultimate":
-            self.layer_idx = 1
-        else:
-            raise NotImplementedError()
-
-    def freeze(self):
-        self.model = self.model.set_train(False)
-        for param in self.get_parameters():
-            param.requires_grad = False
-
-    def construct(self, text):
-        tokens = open_clip.tokenize(text)
-        z = self.encode_with_transformer(tokens)
-        return z
-
-    def encode_with_transformer(self, text):
-        x = self.model.token_embedding(text)  # [batch_size, n_ctx, d_model]
-        x = x + self.model.positional_embedding
-        x = x.transpose(1, 0, 2)  # NLD -> LND
-        x = self.text_transformer_forward(x, attn_mask=self.model.attn_mask)
-        x = x.transpose(1, 0, 2)  # LND -> NLD
-        x = self.model.ln_final(x)
-        return x
-
-    def text_transformer_forward(self, x: ms.Tensor, attn_mask=None):
-        for i, r in enumerate(self.model.transformer.resblocks):
-            if i == len(self.model.transformer.resblocks) - self.layer_idx:
-                break
-            if self.model.transformer.grad_checkpointing:
-                # x = checkpoint(r, x, attn_mask)
-                raise NotImplementedError("Gradiant checkpointing is not supported for now!")
-            else:
-                x = r(x, attn_mask=attn_mask)
-        return x
-
-    def encode(self, text):
-        return self(text)
-
-
-class FrozenOpenCLIPVisualEmbedder(nn.Cell):
-    """
-    Uses the OpenCLIP transformer encoder for text
-    """
-
-    LAYERS = [
-        # "pooled",
-        "last",
-        "penultimate",
-    ]
-
-    def __init__(
-        self,
-        arch="ViT-H-14",
-        pretrained="laion2b_s32b_b79k",
-        max_length=77,
-        freeze=True,
-        layer="last",
-        input_shape=(224, 224, 3),
-    ):
-        super().__init__()
-        assert layer in self.LAYERS
-
-        # version = 'cache/open_clip_pytorch_model.bin'
-        model, _, preprocess = open_clip.create_model_and_transforms(arch, pretrained=pretrained)
-        del model.transformer
-        self.model = model
-
-        data_white = np.ones(input_shape, dtype=np.uint8) * 255
-        self.black_image = preprocess(vision.ToPIL()(data_white)).unsqueeze(0)
-        self.preprocess = preprocess
-
-        self.max_length = max_length
-        if freeze:
-            self.freeze()
-        self.layer = layer
-        if self.layer == "last":
-            self.layer_idx = 0
-        elif self.layer == "penultimate":
-            self.layer_idx = 1
-        else:
-            raise NotImplementedError()
-
-    def freeze(self):
-        self.model = self.model.set_train(False)
-        for param in self.get_parameters():
-            param.requires_grad = False
-
-    def construct(self, image):
-        z = self.model.encode_image(image)
-        return z
-
-    def encode(self, text):
-        return self(text)
-
-
-def find_free_port():
-    """https://stackoverflow.com/questions/1365265/on-localhost-how-do-i-pick-a-free-port-number"""
-    import socket
-    from contextlib import closing
-
-    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
-        s.bind(("", 0))
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        return str(s.getsockname()[1])
-
-
 def setup_seed(seed):
     ms.set_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
+
+
+def load_clip_model(arch, pretrained_ckpt_path):
+    """
+    Load CLIP model.
+
+    Args:
+        arch (str): Model architecture.
+        pretrained_ckpt_path (str): Path of the pretrained checkpoint.
+    Returns:
+        model (CLIPModel): CLIP model.
+    """
+    if arch.lower() not in support_list:
+        raise ValueError(f"arch {arch} is not supported")
+    config_path = support_list[arch.lower()]
+
+    config = parse(config_path, pretrained_ckpt_path)
+    model = CLIPModel(config)
+    return model
+
+
+def load_ckpt_tokenizer(tokenizer_path):
+    text_processor = CLIPTokenizer(tokenizer_path, pad_token="!")
+    return text_processor
+
+
+class FrozenOpenCLIPEmbedder(nn.Cell):
+    def __init__(
+        self,
+        arch="open_clip_vit_h_14",
+        pretrained_ckpt_path="./vit-h-14-laion-2b/open_clip_vit_h_14.ckpt",
+        tokenizer_path="./vit-h-14-laion-2b/bpe_simple_vocab_16e6.txt.gz",
+        freeze=True,
+        layer="penultimate",
+    ):
+        super().__init__()
+        model = load_clip_model(arch, pretrained_ckpt_path)
+        del model.visual
+        self.model = model
+        self.layer = layer
+        self.freeze = freeze
+        if self.freeze:
+            self.model.set_train(False)
+            for name, param in self.model.parameters_and_names():
+                param.requires_grad = False
+
+        if self.layer == "last":
+            layer_index = 0
+        elif self.layer == "penultimate":
+            layer_index = 1
+            old_layers = len(self.model.transformer.resblocks)
+            self.delete_last_n_layers_from_resblocks(layer_index)
+            new_layers = len(self.model.transformer.resblocks)
+            print(f"Transformer Resblocks Layers change from {old_layers} to {new_layers}")
+        else:
+            raise ValueError(f"layer {layer} is not supported")
+
+        self.tokenizer = load_ckpt_tokenizer(tokenizer_path)
+
+    def delete_last_n_layers_from_resblocks(self, layer_index):
+        assert layer_index < len(self.model.transformer.resblocks) and layer_index >= 0
+        N = len(self.model.transformer.resblocks)
+        index = N - 1
+        for _ in range(layer_index):
+            del self.model.transformer.resblocks[index]
+            index -= 1
+        return
+
+    def process_text(self, text_prompt):
+        return ms.Tensor(self.tokenizer(text_prompt, padding="max_length", max_length=77)["input_ids"]).reshape(1, -1)
+
+    def construct(self, text):
+        if isinstance(text, str):
+            text = [text]
+        token_ids = self.process_text(text)
+        text_features = self.get_text_features(token_ids)
+        return text_features
+
+    def encode(self, text):
+        return self.construct(text)
+
+    def get_text_features(self, text: ms.Tensor, input_ids: Optional[ms.Tensor] = None):
+        r"""Get_text_features
+
+        Args:
+            text (ms.Tensor): A text id tensor processed by tokenizer.
+            input_ids (Optional[ms.Tensor]): Equal to "text",
+                if "input_ids" is set, "text" is useless.
+
+        Returns:
+            Text feature.
+        """
+        if input_ids is not None:
+            text = input_ids
+        text_ = self.model.token_embedding(text)
+        text_ = text_.astype(self.model.dtype)
+        text_ = ops.Add()(text_, self.model.positional_embedding)
+        text_ = text_.transpose(1, 0, 2)
+        text_ = self.model.transformer(text_)
+        text_ = text_.transpose(1, 0, 2)
+        text_ = self.model.ln_final(text_)
+
+        text_ = ops.matmul(text_[ms.numpy.arange(text_.shape[0]), text.argmax(-1)], self.model.text_projection)
+        return text_
+
+
+class FrozenOpenCLIPVisualEmbedder(nn.Cell):
+    def __init__(
+        self,
+        arch="open_clip_vit_h_14",
+        pretrained_ckpt_path="./vit-h-14-laion-2b/open_clip_vit_h_14.ckpt",
+        freeze=True,
+        layer="penultimate",
+        resolution=224,
+    ):
+        super().__init__()
+        model = load_clip_model(arch, pretrained_ckpt_path)
+        del model.transformer
+
+        self.model = model
+        self.image_processor = CLIPImageProcessor(resolution)
+
+        data_white = np.ones((resolution, resolution, 3)) * 255
+        self.black_image = Image.fromarray(data_white.astype(np.uint8)).convert("RGB")
+
+        self.layer = layer  # the layer does not apply to visual embedder
+        if self.layer == "last":
+            self.layer_index = 0
+        elif self.layer == "penultimate":
+            self.layer_index = 1
+        else:
+            raise ValueError(f"layer {layer} is not supported")
+
+        self.freeze = freeze
+        if self.freeze:
+            self.model.set_train(False)
+            for name, param in self.model.parameters_and_names():
+                param.requires_grad = False
+
+    def construct(self, image):
+        if not isinstance(image, list):
+            image_ = self.image_processor(image)
+            image_features = self.model.get_image_features(image_)
+        else:
+            image_ = [self.image_processor(img) for img in image]
+            image_features = [self.model.get_image_features(img) for img in image_]
+        # the returned features are non-normalilzed
+
+        # normalization
+        # if not is_old_ms_version("2.0.0-alpha"):
+        #     L2_norm_ops = partial(ops.norm, ord=2, dim=1, keepdim=True)
+        # else:
+        #     L2_norm_ops = partial(ops.norm, p=2, axis=1, keep_dims=True)
+
+        # image_features = L2_norm_ops(image_features) if not isinstance(image_features, list) else [
+        #     L2_norm_ops(img_feat) for img_feat in image_features]
+        return image_features
