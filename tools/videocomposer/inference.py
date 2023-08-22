@@ -51,17 +51,18 @@ def beta_schedule(schedule, num_timesteps=1000, init_beta=None, last_beta=None):
         raise ValueError(f"Unsupported schedule: {schedule}")
 
 
-def random_resize(img, size):
-    img = [
-        vision.Resize(
-            size,
+class RandomResize(object):
+    def __init__(self, size):
+        self.size = size
+
+    def __call__(self, img):
+        img = vision.Resize(
+            self.size,
             interpolation=random.choice(
                 [InterpolationMode.BILINEAR, InterpolationMode.BICUBIC, InterpolationMode.ANTIALIAS]
             ),
-        )(u)
-        for u in img
-    ]
-    return img
+        )(img)
+        return img
 
 
 class CenterCrop(object):

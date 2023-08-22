@@ -2,12 +2,11 @@ import argparse
 import copy
 import json
 import os
+import logging
 
 import yaml
 
-import utils.logging as logging
-
-logger = logging.get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class Config(object):

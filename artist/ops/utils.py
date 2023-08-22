@@ -29,7 +29,7 @@ def video_tensor_to_gif(tensor, path, duration=120, loop=0, optimize=True):
     tensor = tensor.permute(1, 2, 3, 0)
     images = tensor.unbind(dim=0)
     images = [(image.numpy() * 255).astype("uint8") for image in images]
-    imageio.mimwrite(path, images, fps=8)
+    imageio.mimwrite(path, images, duration=duration)
     return images
 
 
@@ -102,9 +102,9 @@ def save_video_multiple_conditions(
         source_imgs = rearrange_tensor(source_imgs)
 
         if save_origin_video:
-            vid_gif = ops.cat([source_imgs, cons_list, vid_gif], axis=3)
+            vid_gif = ops.cat([source_imgs, *cons_list, vid_gif], axis=3)
         else:
-            vid_gif = ops.cat([cons_list, vid_gif], axis=3)
+            vid_gif = ops.cat([*cons_list, vid_gif], axis=3)
 
         video_tensor_to_gif(vid_gif, filename)
     except Exception as e:

@@ -2,8 +2,6 @@ import logging
 import os
 import os.path as osp
 import sys
-from copy import copy, deepcopy
-from functools import partial
 from importlib import reload
 
 import mindspore as ms
@@ -24,10 +22,10 @@ from .inference import (
     CenterCrop,
     FrozenOpenCLIPEmbedder,
     FrozenOpenCLIPVisualEmbedder,
+    RandomResize,
     beta_schedule,
     get_first_stage_encoding,
     make_masked_images,
-    random_resize,
     setup_seed,
 )
 from .unet_sd import UNetSD_temporal
@@ -44,14 +42,16 @@ def inference_multi(cfg_update, **kwargs):
     cfg.pmi_world_size = int(os.getenv("WORLD_SIZE", 1))  # n_nodes?
     setup_seed(cfg.seed)
 
-    if cfg.debug:
-        cfg.gpus_per_machine = 1
-        cfg.world_size = 1
-    else:
-        # LOCAL_WORLD_SIZE - The local world size (e.g. number of workers running locally); (nproc-per-node)
-        cfg.gpus_per_machine = ms.communication.get_group_size()
-        # WORLD_SIZE - The world size (total number of workers in the job).
-        cfg.world_size = cfg.pmi_world_size * cfg.gpus_per_machine
+    cfg.gpus_per_machine = 1
+    cfg.world_size = 1
+    # if cfg.debug:
+    #     cfg.gpus_per_machine = 1
+    #     cfg.world_size = 1
+    # else:
+    #     # LOCAL_WORLD_SIZE - The local world size (e.g. number of workers running locally); (nproc-per-node)
+    #     cfg.gpus_per_machine = ms.communication.get_group_size()
+    #     # WORLD_SIZE - The world size (total number of workers in the job).
+    #     cfg.world_size = cfg.pmi_world_size * cfg.gpus_per_machine
 
     if cfg.world_size == 1:
         worker(0, cfg)
@@ -107,14 +107,28 @@ def worker(gpu, cfg):
 
     # [Transform] Transforms for different inputs
     infer_transforms = transforms.Compose(
-        [vision.CenterCrop(size=cfg.resolution), vision.ToTensor(), vision.Normalize(mean=cfg.mean, std=cfg.std)]
+        [
+            vision.CenterCrop(size=cfg.resolution),
+            vision.ToTensor(),
+            vision.Normalize(mean=cfg.mean, std=cfg.std, is_hwc=False),
+        ]
     )
     misc_transforms = transforms.Compose(
-        [partial(random_resize, size=cfg.misc_size), vision.CenterCrop(cfg.misc_size), vision.ToTensor()]
+        [
+            RandomResize(size=cfg.misc_size),
+            vision.CenterCrop(cfg.misc_size),
+            vision.ToTensor(),
+        ]
     )
-    mv_transforms = transforms.Compose([vision.Resize(size=cfg.resolution), vision.CenterCrop(cfg.resolution)])
+    mv_transforms = transforms.Compose(
+        [vision.Resize(size=cfg.resolution), vision.CenterCrop(cfg.resolution)],
+    )
     vit_transforms = transforms.Compose(
-        [CenterCrop(cfg.vit_image_size), vision.ToTensor(), vision.Normalize(mean=cfg.vit_mean, std=cfg.vit_std)]
+        [
+            CenterCrop(cfg.vit_image_size),
+            vision.ToTensor(),
+            vision.Normalize(mean=cfg.vit_mean, std=cfg.vit_std, is_hwc=False),
+        ]
     )
 
     dataset = VideoDataset(
@@ -131,25 +145,41 @@ def worker(gpu, cfg):
         misc_size=cfg.misc_size,
     )
 
-    dataloader = ds.GeneratorDataset(source=dataset)
+    dataloader = ds.GeneratorDataset(
+        source=dataset,
+        column_names=["ref_frame", "cap_txt", "video_data", "misc_data", "feature_framerate", "mask", "mv_data"],
+    )
+    dataloader = dataloader.batch(1)
 
-    clip_encoder = FrozenOpenCLIPEmbedder(layer="penultimate", pretrained=DOWNLOAD_TO_CACHE(cfg.clip_checkpoint))
-    zero_y = ms.ops.stop_gradient(clip_encoder(""))  # [1, 77, 1024]
+    clip_encoder = FrozenOpenCLIPEmbedder(
+        layer="penultimate",
+        pretrained_ckpt_path=DOWNLOAD_TO_CACHE(cfg.clip_checkpoint),
+        tokenizer_path=DOWNLOAD_TO_CACHE(cfg.clip_tokenizer),
+    )
+    zero_y = ms.ops.stop_gradient(clip_encoder("")).to(ms.float32)  # [1, 77, 1024]
 
     clip_encoder_visual = FrozenOpenCLIPVisualEmbedder(
-        layer="penultimate", pretrained=DOWNLOAD_TO_CACHE(cfg.clip_checkpoint)
+        layer="penultimate", pretrained_ckpt_path=DOWNLOAD_TO_CACHE(cfg.clip_checkpoint)
     )
-    black_image_feature = clip_encoder_visual(clip_encoder_visual.black_image).unsqueeze(1)  # [1, 1, 1024]
+    black_image_feature = (
+        clip_encoder_visual(clip_encoder_visual.black_image).unsqueeze(1).to(ms.float32)
+    )  # [1, 1, 1024]
     black_image_feature = ms.ops.zeros_like(black_image_feature)  # for old
 
     # [Conditions] Generators for various conditions
     if "depthmap" in cfg.video_compositions:
-        midas = midas_v3(pretrained=True).set_train(False).to_float(ms.float16)
+        midas = midas_v3(
+            pretrained=True, ckpt_path=DOWNLOAD_TO_CACHE(cfg.midas_checkpoint)
+        ).set_train(False).to_float(ms.float32)
     if "canny" in cfg.video_compositions:
         canny_detector = CannyDetector()
     if "sketch" in cfg.video_compositions:
-        pidinet = pidinet_bsd(pretrained=True, vanilla_cnn=True).set_train(False)
-        cleaner = sketch_simplification_gan(pretrained=True).set_train(False)
+        pidinet = pidinet_bsd(
+            pretrained=True, vanilla_cnn=True, ckpt_path=DOWNLOAD_TO_CACHE(cfg.pidinet_checkpoint)
+        ).set_train(False).to_float(ms.float32)
+        cleaner = sketch_simplification_gan(
+            pretrained=True, ckpt_path=DOWNLOAD_TO_CACHE(cfg.sketch_simplification_checkpoint)
+        ).set_train(False).to_float(ms.float32)
         pidi_mean = ms.Tensor(cfg.sketch_mean).view(1, -1, 1, 1)
         pidi_std = ms.Tensor(cfg.sketch_std).view(1, -1, 1, 1)
     # Placeholder for color inference
@@ -169,7 +199,7 @@ def worker(gpu, cfg):
         "dropout": 0.0,
     }
     autoencoder = AutoencoderKL(ddconfig, 4, ckpt_path=DOWNLOAD_TO_CACHE(cfg.sd_checkpoint))
-    autoencoder.set_train(False)
+    autoencoder.set_train(False).to_float(ms.float32)
     for param in autoencoder.get_parameters():
         param.requires_grad = False
 
@@ -199,7 +229,7 @@ def worker(gpu, cfg):
             p_all_keep=cfg.p_all_zero,
             zero_y=zero_y,
             black_image_feature=black_image_feature,
-        )
+        ).to_float(ms.float32)
     else:
         logging.info("Other model type not implement, exist")
         raise NotImplementedError(f"The model {cfg.network_name} not implement")
@@ -208,23 +238,20 @@ def worker(gpu, cfg):
     resume_step = 1
     if cfg.resume and cfg.resume_checkpoint:
         if hasattr(cfg, "text_to_video_pretrain") and cfg.text_to_video_pretrain:
-            ss = ms.load_checkpoint(DOWNLOAD_TO_CACHE(cfg.resume_checkpoint))
-            ss = {key: p for key, p in ss.items() if "input_blocks.0.0" not in key}
-            model.load_state_dict(ss, strict=False)
+            model.load_state_dict(DOWNLOAD_TO_CACHE(cfg.resume_checkpoint), text_to_video_pretrain=True)
         else:
-            model.load_state_dict(ms.load_checkpoint(DOWNLOAD_TO_CACHE(cfg.resume_checkpoint)), strict=False)
+            model.load_state_dict(DOWNLOAD_TO_CACHE(cfg.resume_checkpoint), text_to_video_pretrain=False)
         if cfg.resume_step:
             resume_step = cfg.resume_step
 
         logging.info(f"Successfully load step {resume_step} model from {cfg.resume_checkpoint}")
     else:
-        logging.error(f"The checkpoint file {cfg.resume_checkpoint} is wrong")
         raise ValueError(f"The checkpoint file {cfg.resume_checkpoint} is wrong ")
 
     # mark model size
     if cfg.rank == 0:
         logging.info(
-            f"Created a model with {int(sum(p.numel() for p in model.parameters()) / (1024 ** 2))}M parameters"
+            f"Created a model with {int(sum(p.numel() for p in model.get_parameters()) / (1024 ** 2))}M parameters"
         )
 
     # diffusion
@@ -238,7 +265,7 @@ def worker(gpu, cfg):
     for step, batch in enumerate(dataloader.create_tuple_iterator()):
         model.set_train(False)
 
-        caps = batch[1]
+        caps = batch[1].numpy().tolist()
         del batch[1]
         if cfg.max_frames == 1 and cfg.use_image_dataset:
             ref_imgs, video_data, misc_data, mask, mv_data = batch
@@ -247,7 +274,7 @@ def worker(gpu, cfg):
             ref_imgs, video_data, misc_data, fps, mask, mv_data = batch
 
         # save for visualization
-        misc_backups = copy(misc_data)
+        misc_backups = misc_data.copy()
         misc_backups = ms.ops.transpose(misc_backups, (0, 2, 1, 3, 4))
         mv_data_video = []
         if "motion" in cfg.video_compositions:
@@ -256,7 +283,7 @@ def worker(gpu, cfg):
         # mask images
         masked_video = []
         if "mask" in cfg.video_compositions:
-            masked_video = make_masked_images(misc_data.sub(0.5).div_(0.5), mask)
+            masked_video = make_masked_images((misc_data - 0.5) / 0.5, mask)
             masked_video = ms.ops.transpose(masked_video, (0, 2, 1, 3, 4))
 
         image_local = []
@@ -269,10 +296,8 @@ def worker(gpu, cfg):
         # encode the video_data
         bs_vd = video_data.shape[0]
         video_data_origin = video_data.copy()
-        b, f, c, h, w = video_data.shape
-        video_data = ms.ops.reshape(video_data, (b * f, c, h, w))
-        b, f, c, h, w = misc_data.shape
-        misc_data = ms.ops.transpose(misc_data, (b * f, c, h, w))
+        video_data = ms.ops.reshape(video_data, (video_data.shape[0] * video_data.shape[1], *video_data.shape[2:]))
+        misc_data = ms.ops.reshape(misc_data, (misc_data.shape[0] * misc_data.shape[1], *misc_data.shape[2:]))
 
         video_data_list = ms.ops.chunk(video_data, video_data.shape[0] // cfg.chunk_size, axis=0)
         misc_data_list = ms.ops.chunk(misc_data, misc_data.shape[0] // cfg.chunk_size, axis=0)
@@ -281,24 +306,22 @@ def worker(gpu, cfg):
         decode_data = []
         for vd_data in video_data_list:
             encoder_posterior = autoencoder.encode(vd_data)
-            tmp = get_first_stage_encoding(encoder_posterior).detach()
+            tmp = get_first_stage_encoding(encoder_posterior)
             decode_data.append(tmp)
         video_data = ms.ops.cat(decode_data, axis=0)
-        bf, c, h, w = video_data.shape
-        b, f = bs_vd, bf // bs_vd
-        video_data = ms.ops.reshape(video_data, (b, f, c, h, w))
+        # (b f) c h w -> b f c h w -> b c f h w
+        video_data = ms.ops.reshape(video_data, (bs_vd, video_data.shape[0] // bs_vd, *video_data.shape[1:]))
         video_data = ms.ops.transpose(video_data, (0, 2, 1, 3, 4))
 
         depth_data = []
         if "depthmap" in cfg.video_compositions:
             for misc_imgs in misc_data_list:
-                depth = midas(misc_imgs.sub(0.5).div_(0.5).half())
-                depth = (depth / cfg.depth_std).clamp_(0, cfg.depth_clamp)
+                depth = midas((misc_imgs - 0.5) / 0.5)
+                depth = (depth / cfg.depth_std).clamp(0, cfg.depth_clamp)
                 depth_data.append(depth)
             depth_data = ms.ops.cat(depth_data, axis=0)
-            bf, c, h, w = depth_data.shape
-            b, f = bs_vd, bf // bs_vd
-            depth_data = ms.ops.reshape(depth_data, (b, f, c, h, w))
+            # (b f) c h w -> b f c h w -> b c f h w
+            depth_data = ms.ops.reshape(depth_data, (bs_vd, depth_data.shape[0] // bs_vd, *depth_data.shape[1:]))
             depth_data = ms.ops.transpose(depth_data, (0, 2, 1, 3, 4))
 
         canny_data = []
@@ -310,21 +333,19 @@ def worker(gpu, cfg):
                 canny_condition = ms.ops.transpose(canny_condition, (0, 3, 1, 2))
                 canny_data.append(canny_condition)
             canny_data = ms.ops.cat(canny_data, axis=0)
-            bf, c, h, w = canny_data.shape
-            b, f = bs_vd, bf // bs_vd
-            canny_data = ms.ops.reshape(canny_data, (b, f, c, h, w))
+            # (b f) c h w -> b f c h w -> b c f h w
+            canny_data = ms.ops.reshape(canny_data, (bs_vd, canny_data.shape[0] // bs_vd, *canny_data.shape[1:]))
             canny_data = ms.ops.transpose(canny_data, (0, 2, 1, 3, 4))
 
         sketch_data = []
         if "sketch" in cfg.video_compositions:
             for misc_imgs in misc_data_list:
-                sketch = pidinet(misc_imgs.sub(pidi_mean).div_(pidi_std))
+                sketch = pidinet((misc_imgs - pidi_mean) / pidi_std)
                 sketch = 1.0 - cleaner(1.0 - sketch)
                 sketch_data.append(sketch)
             sketch_data = ms.ops.cat(sketch_data, axis=0)
-            bf, c, h, w = sketch_data.shape
-            b, f = bs_vd, bf // bs_vd
-            sketch_data = ms.ops.reshape(sketch_data, (b, f, c, h, w))
+            # (b f) c h w -> b f c h w -> b c f h w
+            sketch_data = ms.ops.reshape(sketch_data, (bs_vd, sketch_data.shape[0] // bs_vd, *sketch_data.shape[1:]))
             sketch_data = ms.ops.transpose(sketch_data, (0, 2, 1, 3, 4))
 
         single_sketch_data = []
@@ -333,14 +354,14 @@ def worker(gpu, cfg):
         # with torch.no_grad() end
 
         # preprocess for input text descripts
-        y = clip_encoder(caps)  # [1, 77, 1024]
+        y = clip_encoder(caps).to(ms.float32)  # [1, 77, 1024]
         y0 = y.copy()
 
         y_visual = []
         if "image" in cfg.video_compositions:
             # with torch.no_grad():
-            ref_imgs = ref_imgs.squeeze(1)
-            y_visual = clip_encoder_visual(ref_imgs).unsqueeze(1)  # [1, 1, 1024]
+            # ref_imgs = ref_imgs.squeeze(1)  # (1, 3, 224, 224) todo: torch.squeeze does nothing?
+            y_visual = clip_encoder_visual(ref_imgs).unsqueeze(1).to(ms.float32)  # [1, 1, 1024]
             y_visual0 = y_visual.copy()
 
         # with torch.no_grad() start
@@ -355,9 +376,8 @@ def worker(gpu, cfg):
             b, c, f, h, w = video_data.shape
             noise = ms.ops.randn((viz_num, c, h, w))
             noise = noise.repeat_interleave(repeats=f, dim=0)
-            bf, c, h, w = noise.shape
-            b, f = viz_num, bf // viz_num
-            noise = ms.ops.reshape(noise, (b, f, c, h, w))
+            # (b f) c h w -> b c f h w
+            noise = ms.ops.reshape(noise, (viz_num, noise.shape[0] // viz_num, *noise.shape[1:]))
             noise = ms.ops.transpose(noise, (0, 2, 1, 3, 4))
         else:
             noise = ms.ops.randn_like(video_data[:viz_num])
@@ -376,7 +396,7 @@ def worker(gpu, cfg):
                 "fps": fps[:viz_num],
             },
             {
-                "y": zero_y.repeat(viz_num, 1, 1) if not cfg.use_fps_condition else ms.ops.zeros_like(y0)[:viz_num],
+                "y": zero_y.tile((viz_num, 1, 1)) if not cfg.use_fps_condition else ms.ops.zeros_like(y0)[:viz_num],
                 "local_image": None if len(image_local) == 0 else image_local[:viz_num],
                 "image": None if len(y_visual) == 0 else ms.ops.zeros_like(y_visual0[:viz_num]),
                 "depth": None if len(depth_data) == 0 else depth_data[:viz_num],

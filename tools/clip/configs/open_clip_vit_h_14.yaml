@@ -20,6 +20,6 @@ vision_config:
   initializer_range: 0.02
   initializer_factor: 1.0
 
-dtype: float16  # type of tensors
+dtype: float32  # type of tensors
 projection_dim: 1024  # feature dims
 logit_scale_init_value: 2.6592

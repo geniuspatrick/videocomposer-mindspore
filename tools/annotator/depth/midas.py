@@ -15,13 +15,12 @@ r"""A much cleaner re-implementation of ``https://github.com/isl-org/MiDaS''.
 """
 import collections
 import math
-import os
 
 import mindspore as ms
-import mindspore.nn as nn
-import mindspore.ops as ops
-from mindspore import Parameter
+from mindspore import Parameter, nn, ops
 from mindspore.common.initializer import Normal, initializer
+
+from utils.pt2ms import load_pt_weights_in_model
 
 __all__ = ["MiDaS", "midas_v3"]
 
@@ -96,23 +95,6 @@ class AttentionBlock(nn.Cell):
         return x
 
 
-class conv_nd(nn.Cell):
-    def __init__(self, dims, *args, **kwargs):
-        super().__init__()
-        if dims == 1:
-            self.conv = nn.Conv1d(*args, **kwargs)
-        elif dims == 2:
-            self.conv = nn.Conv2d(*args, **kwargs)
-        elif dims == 3:
-            self.conv = nn.Conv3d(*args, **kwargs)
-        else:
-            raise ValueError(f"unsupported dimensions: {dims}")
-
-    def construct(self, x, emb=None, context=None):
-        x = self.conv(x)
-        return x
-
-
 class VisionTransformer(nn.Cell):
     def __init__(self, image_size=384, patch_size=16, dim=1024, out_dim=1000, num_heads=16, num_layers=24):
         assert image_size % patch_size == 0
@@ -126,8 +108,8 @@ class VisionTransformer(nn.Cell):
         self.num_patches = (image_size // patch_size) ** 2
 
         # embeddings
-        self.patch_embedding = conv_nd(
-            3, 3, dim, kernel_size=patch_size, stride=patch_size, has_bias=True, pad_mode="pad"
+        self.patch_embedding = nn.Conv2d(
+            3, dim, kernel_size=patch_size, stride=patch_size, has_bias=True, pad_mode="pad"
         )
         self.cls_embedding = Parameter(ms.Tensor(ops.zeros((1, 1, dim)), ms.float32))
         self.pos_embedding = Parameter(initializer(Normal(sigma=0.02), (1, self.num_patches + 1, dim), ms.float32))
@@ -169,9 +151,9 @@ class ResidualBlock(nn.Cell):
             collections.OrderedDict(
                 [
                     ("0", nn.ReLU()),
-                    ("1", conv_nd(2, dim, dim, 3, padding=1, has_bias=True, pad_mode="pad")),
+                    ("1", nn.Conv2d(dim, dim, 3, padding=1, has_bias=True, pad_mode="pad")),
                     ("2", nn.ReLU()),
-                    ("3", conv_nd(2, dim, dim, 3, padding=1, has_bias=True, pad_mode="pad")),
+                    ("3", nn.Conv2d(dim, dim, 3, padding=1, has_bias=True, pad_mode="pad")),
                 ]
             )
         )
@@ -188,7 +170,7 @@ class FusionBlock(nn.Cell):
         # layers
         self.layer1 = ResidualBlock(dim)
         self.layer2 = ResidualBlock(dim)
-        self.conv_out = conv_nd(2, dim, dim, 1, has_bias=True, pad_mode="pad")
+        self.conv_out = nn.Conv2d(dim, dim, 1, has_bias=True, pad_mode="pad")
 
     def construct(self, *xs):
         assert len(xs) in (1, 2), "invalid number of inputs"
@@ -231,25 +213,25 @@ class MiDaS(nn.Cell):
         self.num_patches = (image_size // patch_size) ** 2
 
         # embeddings
-        self.patch_embedding = conv_nd(
-            2, 3, dim, kernel_size=patch_size, stride=patch_size, has_bias=True, pad_mode="pad"
+        self.patch_embedding = nn.Conv2d(
+            3, dim, kernel_size=patch_size, stride=patch_size, has_bias=True, pad_mode="pad"
         )
         self.cls_embedding = Parameter(ms.Tensor(ops.zeros((1, 1, dim)), ms.float32))
         self.pos_embedding = Parameter(initializer(Normal(sigma=0.02), (1, self.num_patches + 1, dim), ms.float32))
 
         # blocks
         stride = num_layers // 4
-        self.blocks = [nn.SequentialCell([AttentionBlock(dim, num_heads) for _ in range(i * stride, (i + 1) * stride)]) for i in range(4)]
-        self.blocks = nn.CellList(self.blocks)
+        self.blocks = nn.SequentialCell(*[AttentionBlock(dim, num_heads) for _ in range(num_layers)])
+        self.slices = [slice(i * stride, (i + 1) * stride) for i in range(4)]
 
         # stage1 (4x)
         self.fc1 = nn.SequentialCell(collections.OrderedDict([("0", nn.Dense(dim * 2, dim)), ("1", GELU())]))
         self.conv1 = nn.SequentialCell(
             collections.OrderedDict(
                 [
-                    ("0", conv_nd(2, dim, neck_dims[0], 1, has_bias=True, pad_mode="pad")),
+                    ("0", nn.Conv2d(dim, neck_dims[0], 1, has_bias=True, pad_mode="pad")),
                     ("1", nn.Conv2dTranspose(neck_dims[0], neck_dims[0], 4, stride=4, has_bias=True, pad_mode="pad")),
-                    ("2", conv_nd(2, neck_dims[0], fusion_dim, 3, padding=1, has_bias=False, pad_mode="pad")),
+                    ("2", nn.Conv2d(neck_dims[0], fusion_dim, 3, padding=1, has_bias=False, pad_mode="pad")),
                 ]
             )
         )
@@ -260,9 +242,9 @@ class MiDaS(nn.Cell):
         self.conv2 = nn.SequentialCell(
             collections.OrderedDict(
                 [
-                    ("0", conv_nd(2, dim, neck_dims[1], 1, has_bias=True, pad_mode="pad")),
+                    ("0", nn.Conv2d(dim, neck_dims[1], 1, has_bias=True, pad_mode="pad")),
                     ("1", nn.Conv2dTranspose(neck_dims[1], neck_dims[1], 2, stride=2, has_bias=True, pad_mode="pad")),
-                    ("2", conv_nd(2, neck_dims[1], fusion_dim, 3, padding=1, has_bias=False, pad_mode="pad")),
+                    ("2", nn.Conv2d(neck_dims[1], fusion_dim, 3, padding=1, has_bias=False, pad_mode="pad")),
                 ]
             )
         )
@@ -273,8 +255,8 @@ class MiDaS(nn.Cell):
         self.conv3 = nn.SequentialCell(
             collections.OrderedDict(
                 [
-                    ("0", conv_nd(2, dim, neck_dims[2], 1, has_bias=True, pad_mode="pad")),
-                    ("1", conv_nd(2, neck_dims[2], fusion_dim, 3, padding=1, has_bias=False, pad_mode="pad")),
+                    ("0", nn.Conv2d(dim, neck_dims[2], 1, has_bias=True, pad_mode="pad")),
+                    ("1", nn.Conv2d(neck_dims[2], fusion_dim, 3, padding=1, has_bias=False, pad_mode="pad")),
                 ]
             )
         )
@@ -285,12 +267,12 @@ class MiDaS(nn.Cell):
         self.conv4 = nn.SequentialCell(
             collections.OrderedDict(
                 [
-                    ("0", conv_nd(2, dim, neck_dims[3], 1, has_bias=True, pad_mode="pad")),
+                    ("0", nn.Conv2d(dim, neck_dims[3], 1, has_bias=True, pad_mode="pad")),
                     (
                         "1",
-                        conv_nd(2, neck_dims[3], neck_dims[3], 3, stride=2, padding=1, has_bias=True, pad_mode="pad"),
+                        nn.Conv2d(neck_dims[3], neck_dims[3], 3, stride=2, padding=1, has_bias=True, pad_mode="pad"),
                     ),
-                    ("2", conv_nd(2, neck_dims[3], fusion_dim, 3, padding=1, has_bias=False, pad_mode="pad")),
+                    ("2", nn.Conv2d(neck_dims[3], fusion_dim, 3, padding=1, has_bias=False, pad_mode="pad")),
                 ]
             )
         )
@@ -298,18 +280,18 @@ class MiDaS(nn.Cell):
 
         # head
         # self.head = nn.SequentialCell(collections.OrderedDict([
-        #     ("0", conv_nd(2, fusion_dim, fusion_dim // 2, 3, padding=1, has_bias=True, pad_mode="pad")),
+        #     ("0", nn.Conv2d(fusion_dim, fusion_dim // 2, 3, padding=1, has_bias=True, pad_mode="pad")),
         #     ("1", nn.Upsample(scale_factor=2.0, mode='area')),
-        #     ("2", conv_nd(2, fusion_dim // 2, 32, 3, padding=1, has_bias=True, pad_mode="pad")),
+        #     ("2", nn.Conv2d(fusion_dim // 2, 32, 3, padding=1, has_bias=True, pad_mode="pad")),
         #     ("3", nn.ReLU()),
         #     ("4", nn.Conv2dTranspose(32, 1, 1, has_bias=True, pad_mode="pad")),
         #     ("5", nn.ReLU())
         #     ]))
         self.head = nn.CellList(
             [
-                conv_nd(2, fusion_dim, fusion_dim // 2, 3, padding=1, has_bias=True, pad_mode="pad"),
+                nn.Conv2d(fusion_dim, fusion_dim // 2, 3, padding=1, has_bias=True, pad_mode="pad"),
                 nn.Identity(),
-                conv_nd(2, fusion_dim // 2, 32, 3, padding=1, has_bias=True, pad_mode="pad"),
+                nn.Conv2d(fusion_dim // 2, 32, 3, padding=1, has_bias=True, pad_mode="pad"),
                 nn.ReLU(),
                 nn.Conv2dTranspose(32, 1, 1, has_bias=True, pad_mode="pad"),
                 nn.ReLU(),
@@ -343,25 +325,25 @@ class MiDaS(nn.Cell):
         x = x + pos_embedding
 
         # stage1
-        x = self.blocks[0](x)
+        x = self.blocks[self.slices[0]](x)
         x1 = ops.concat([x[:, 1:], x[:, :1].expand_as(x[:, 1:])], axis=-1)
         x1 = nn.Unflatten(2, (hp, wp))(self.fc1(x1).permute(0, 2, 1))
         x1 = self.conv1(x1)
 
         # stage2
-        x = self.blocks[1](x)
+        x = self.blocks[self.slices[1]](x)
         x2 = ops.concat([x[:, 1:], x[:, :1].expand_as(x[:, 1:])], axis=-1)
         x2 = nn.Unflatten(2, (hp, wp))(self.fc2(x2).permute(0, 2, 1))
         x2 = self.conv2(x2)
 
         # stage3
-        x = self.blocks[2](x)
+        x = self.blocks[self.slices[2]](x)
         x3 = ops.concat([x[:, 1:], x[:, :1].expand_as(x[:, 1:])], axis=-1)
         x3 = nn.Unflatten(2, (hp, wp))(self.fc3(x3).permute(0, 2, 1))
         x3 = self.conv3(x3)
 
         # stage4
-        x = self.blocks[3](x)
+        x = self.blocks[self.slices[3]](x)
         x4 = ops.concat([x[:, 1:], x[:, :1].expand_as(x[:, 1:])], axis=-1)
         x4 = nn.Unflatten(2, (hp, wp))(self.fc4(x4).permute(0, 2, 1))
         x4 = self.conv4(x4)
@@ -384,7 +366,7 @@ class MiDaS(nn.Cell):
         return x
 
 
-def midas_v3(pretrained=False, **kwargs):
+def midas_v3(pretrained=False, ckpt_path=None, **kwargs):
     cfg = dict(
         image_size=384,
         patch_size=16,
@@ -394,25 +376,11 @@ def midas_v3(pretrained=False, **kwargs):
         num_heads=16,
         num_layers=24,
     )
-    if "ckpt_path" in kwargs:
-        ckpt_path = kwargs["ckpt_path"]
-        del kwargs["ckpt_path"]
-    else:
-        ckpt_path = None
     cfg.update(**kwargs)
     model = MiDaS(**cfg)
 
     if pretrained:
-        if ckpt_path is None:
-            ckpt_path = os.path.join(os.path.dirname(__file__), "./model_weights/midas_v3_dpt_large_ms.ckpt")
-        state = ms.load_checkpoint(ckpt_path)
-        for pname, p in model.parameters_and_names():
-            if p.name != pname and (p.name not in state and pname in state):
-                param = state.pop(pname)
-                state[p.name] = param  # classifier.conv.weight -> weight; classifier.conv.bias -> bias
-        param_not_load, _ = ms.load_param_into_net(model, state)
-        if len(param_not_load):
-            print("Params not load: {}".format(param_not_load))
+        load_pt_weights_in_model(model, ckpt_path)
     return model
 
 

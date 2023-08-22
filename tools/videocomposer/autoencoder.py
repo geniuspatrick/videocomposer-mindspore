@@ -1,9 +1,9 @@
-import os
-
 import numpy as np
 
 import mindspore as ms
 from mindspore import nn, ops
+
+from utils.pt2ms import load_pt_weights_in_model
 
 __all__ = ["DiagonalGaussianDistribution", "AutoencoderKL"]
 
@@ -48,7 +48,7 @@ class DiagonalGaussianDistribution(object):
                     dim=[1, 2, 3],
                 )
 
-    def nll(self, sample, dims=[1, 2, 3]):
+    def nll(self, sample, dims=(1, 2, 3)):
         if self.deterministic:
             return ms.Tensor([0.0])
         logtwopi = np.log(2.0 * np.pi)
@@ -161,7 +161,7 @@ class Upsample(nn.Cell):
             )
 
     def construct(self, x):
-        x = ops.interpolate(x, scale_factor=2.0, mode="nearest")
+        x = ops.interpolate(x, (x.shape[2] * 2, x.shape[3] * 2), mode="nearest")
         if self.with_conv:
             x = self.conv(x)
         return x
@@ -422,7 +422,7 @@ class AutoencoderKL(nn.Cell):
         ddconfig,
         embed_dim,
         ckpt_path=None,
-        ignore_keys=[],
+        ignore_keys=None,
         image_key="image",
         colorize_nlabels=None,
         monitor=None,
@@ -449,48 +449,18 @@ class AutoencoderKL(nn.Cell):
         if ckpt_path is not None:
             self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
 
-    def init_from_ckpt(self, path, ignore_keys=list()):
-        checkpoint_file = path
-        checkpoint_file_np = f"{os.path.splitext(checkpoint_file)[0]}.npy"
-        if not os.path.exists(checkpoint_file_np):
-            raise FileNotFoundError(f"You need to manually transfer {checkpoint_file} to {checkpoint_file_np}")
-        sd = np.load(checkpoint_file_np, allow_pickle=True).item()
-        sd = {k: ms.Parameter(v.astype(np.float32), name=k) for k, v in sd.items()}
-        keys = list(sd.keys())
+    def init_from_ckpt(self, path, ignore_keys=None):
+        def prune_weights(sd):
+            # find keys start with prefix "first_stage_model" and remove the prefix.
+            sd_new = {}
+            for k in sd.keys():
+                if k.find("first_stage_model") >= 0:
+                    k_new = k.split("first_stage_model.")[-1]
+                    sd_new[k_new] = sd[k]
+            return sd_new
 
-        sd_new = {}
-        for k in keys:
-            if k.find("first_stage_model") >= 0:
-                k_new = k.split("first_stage_model.")[-1]
-                sd_new[k_new] = sd[k]
-
-        param_not_load, ckpt_not_load = ms.load_param_into_net(self, sd_new)
-        if param_not_load or ckpt_not_load:
-            print(f"{param_not_load} in network is not loaded or {ckpt_not_load} in checkpoint is not loaded!")
+        load_pt_weights_in_model(self, path, (prune_weights,))
         print(f"Restored from {path}")
-
-    def init_from_ckpt2(self, path, ignore_keys=list()):
-        checkpoint_file = path
-        checkpoint_file_np = f"{os.path.splitext(checkpoint_file)[0]}.npy"
-        if not os.path.exists(checkpoint_file_np):
-            raise FileNotFoundError(f"You need to manually transfer {checkpoint_file} to {checkpoint_file_np}")
-        sd = np.load(checkpoint_file_np, allow_pickle=True).item()
-        sd = {k: ms.Parameter(v.astype(np.float32), name=k) for k, v in sd.items()}
-        keys = list(sd.keys())
-
-        for k in keys:
-            for ik in ignore_keys:
-                if k.startswith(ik):
-                    print("Deleting key {} from state_dict.".format(k))
-                    del sd[k]
-        param_not_load, ckpt_not_load = ms.load_param_into_net(self, sd)
-        if param_not_load or ckpt_not_load:
-            print(f"{param_not_load} in network is not loaded or {ckpt_not_load} in checkpoint is not loaded!")
-        print(f"Restored from {path}")
-
-    def on_train_batch_end(self, *args, **kwargs):
-        if self.use_ema:
-            self.model_ema(self)
 
     def encode(self, x):
         h = self.encoder(x)

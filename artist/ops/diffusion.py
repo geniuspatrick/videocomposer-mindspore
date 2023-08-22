@@ -1,3 +1,5 @@
+from tqdm import tqdm
+
 import mindspore as ms
 from mindspore import ops
 
@@ -18,10 +20,10 @@ class GaussianDiffusion(object):
     ):
         # check input
         if not isinstance(betas, ms.Tensor):
-            betas = ms.Tensor(betas, dtype=ms.float64)
-        if not betas.dtype == ms.float64:
-            betas = betas.to(ms.float64)
-        assert min(betas) > 0 and max(betas) <= 1
+            betas = ms.Tensor(betas, dtype=ms.float32)
+        if not betas.dtype == ms.float32:
+            betas = betas.to(ms.float32)
+        assert betas.min() > 0 and betas.max() <= 1
         assert mean_type in ["x0", "x_{t-1}", "eps"]
         assert var_type in ["learned", "learned_range", "fixed_large", "fixed_small"]
         assert loss_type in ["mse", "rescaled_mse", "kl", "rescaled_kl", "l1", "rescaled_l1", "charbonnier"]
@@ -99,7 +101,7 @@ class GaussianDiffusion(object):
         xt = noise
 
         # diffusion process
-        for step in ops.arange(self.num_timesteps).flip(0):
+        for step in ops.arange(self.num_timesteps).flip((0,)):
             t = ops.full((b,), step, dtype=ms.int64)
             xt, _ = self.p_sample(xt, t, model, model_kwargs, clamp, percentile, condition_fn, guide_scale)
         return xt
@@ -226,8 +228,9 @@ class GaussianDiffusion(object):
         steps = (
             (1 + ops.arange(0, self.num_timesteps, self.num_timesteps // ddim_timesteps))
             .clamp(0, self.num_timesteps - 1)
-            .flip(0)
+            .flip((0,))
         )
+        steps = tqdm(steps, desc="ddim_sample_loop")
         for step in steps:
             t = ops.full((b,), step, dtype=ms.int64)
             xt, _ = self.ddim_sample(
@@ -364,7 +367,7 @@ class GaussianDiffusion(object):
         steps = (
             (1 + ops.arange(0, self.num_timesteps, self.num_timesteps // plms_timesteps))
             .clamp(0, self.num_timesteps - 1)
-            .flip(0)
+            .flip((0,))
         )
         eps_cache = []
         for step in steps:

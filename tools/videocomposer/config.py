@@ -2,15 +2,12 @@ import os
 
 from easydict import EasyDict
 
-import mindspore as ms
-
 cfg = EasyDict(__name__="Config: VideoComposer")
 
-pmi_world_size = int(os.getenv("WORLD_SIZE", 1))
-gpus_per_machine = ms.communication.get_group_size()
-world_size = pmi_world_size * gpus_per_machine
-
 cfg.video_compositions = ["text", "mask", "depthmap", "sketch", "motion", "image", "local_image", "single_sketch"]
+cfg.midas_checkpoint = "midas_v3_dpt_large.pth"
+cfg.pidinet_checkpoint = "table5_pidinet.pth"
+cfg.sketch_simplification_checkpoint = "sketch_simplification_gan.pth"
 
 # dataset
 cfg.root_dir = "webvid10m/"
@@ -79,7 +76,8 @@ cfg.vit_heads = 16
 cfg.vit_layers = 24
 cfg.vit_mean = [0.48145466, 0.4578275, 0.40821073]
 cfg.vit_std = [0.26862954, 0.26130258, 0.27577711]
-cfg.clip_checkpoint = "open_clip_pytorch_model.bin"
+cfg.clip_checkpoint = "clip/open_clip_vit_h_14.ckpt"
+cfg.clip_tokenizer = "clip/bpe_simple_vocab_16e6.txt.gz"
 cfg.mvs_visual = False
 
 # unet
@@ -119,11 +117,8 @@ if cfg.resume_optimizer:
 
 # acceleration
 cfg.use_ema = True
-# for debug, no ema
-if world_size < 2:
-    cfg.use_ema = False
 cfg.load_from = None
-cfg.use_checkpoint = True
+cfg.use_checkpoint = False
 cfg.use_sharded_ddp = False
 cfg.use_fsdp = False
 cfg.use_fp16 = True

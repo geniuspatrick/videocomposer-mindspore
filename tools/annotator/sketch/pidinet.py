@@ -4,13 +4,15 @@ r"""Modified from ``https://github.com/zhuoinoulu/pidinet''.
         T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])]).
 """
 import math
-import os
+from functools import partial
+
+import numpy as np
 
 import mindspore as ms
-import mindspore.nn as nn
-import mindspore.ops as ops
-from mindspore import Parameter
+from mindspore import Parameter, nn, ops
 from mindspore.common.initializer import Constant, HeUniform, Uniform, initializer
+
+from utils.pt2ms import load_pt_weights_in_model
 
 __all__ = ["PiDiNet", "pidinet_bsd"]
 
@@ -49,88 +51,71 @@ def config_model_converted(model):
     return pdcs
 
 
-# def convert_pdc(op, weight):
-#     if op == 'cv':
-#         return weight
-#     elif op == 'cd':
-#         shape = weight.shape
-#         weight_c = weight.sum(dim=[2, 3])
-#         weight = weight.view(shape[0], shape[1], -1)
-#         weight[:, :, 4] = weight[:, :, 4] - weight_c
-#         weight = weight.view(shape)
-#         return weight
-#     elif op == 'ad':
-#         shape = weight.shape
-#         weight = weight.view(shape[0], shape[1], -1)
-#         weight_conv = (weight - weight[:, :, [3, 0, 1, 6, 4, 2, 7, 8, 5]]).view(shape)
-#         return weight_conv
-#     elif op == 'rd':
-#         shape = weight.shape
-#         buffer = torch.zeros(shape[0], shape[1], 5 * 5, device=weight.device)
-#         weight = weight.view(shape[0], shape[1], -1)
-#         buffer[:, :, [0, 2, 4, 10, 14, 20, 22, 24]] = weight[:, :, 1:]
-#         buffer[:, :, [6, 7, 8, 11, 13, 16, 17, 18]] = -weight[:, :, 1:]
-#         buffer = buffer.view(shape[0], shape[1], 5, 5)
-#         return buffer
-#     raise ValueError("wrong op {}".format(str(op)))
+def convert_pdc(op, weight: np.ndarray):
+    if op == "cv":
+        return weight
+    elif op == "cd":
+        shape = weight.shape
+        weight_c = weight.sum(axis=(2, 3))
+        weight = weight.reshape(shape[0], shape[1], -1)
+        weight[:, :, 4] = weight[:, :, 4] - weight_c
+        weight = weight.reshape(shape)
+        return weight
+    elif op == "ad":
+        shape = weight.shape
+        weight = weight.reshape(shape[0], shape[1], -1)
+        weight_conv = (weight - weight[:, :, [3, 0, 1, 6, 4, 2, 7, 8, 5]]).reshape(shape)
+        return weight_conv
+    elif op == "rd":
+        shape = weight.shape
+        buffer = np.zeros((shape[0], shape[1], 5 * 5))
+        weight = weight.reshape(shape[0], shape[1], -1)
+        buffer[:, :, [0, 2, 4, 10, 14, 20, 22, 24]] = weight[:, :, 1:]
+        buffer[:, :, [6, 7, 8, 11, 13, 16, 17, 18]] = -weight[:, :, 1:]
+        buffer = buffer.reshape(shape[0], shape[1], 5, 5)
+        return buffer
+    raise ValueError("wrong op {}".format(str(op)))
 
 
-# def convert_pidinet(state_dict, config):
-#     pdcs = config_model_converted(config)
-#     new_dict = {}
-#     for pname, p in state_dict.items():
-#         if 'init_block.weight' in pname:
-#             new_dict[pname] = convert_pdc(pdcs[0], p)
-#         elif 'block1_1.conv1.weight' in pname:
-#             new_dict[pname] = convert_pdc(pdcs[1], p)
-#         elif 'block1_2.conv1.weight' in pname:
-#             new_dict[pname] = convert_pdc(pdcs[2], p)
-#         elif 'block1_3.conv1.weight' in pname:
-#             new_dict[pname] = convert_pdc(pdcs[3], p)
-#         elif 'block2_1.conv1.weight' in pname:
-#             new_dict[pname] = convert_pdc(pdcs[4], p)
-#         elif 'block2_2.conv1.weight' in pname:
-#             new_dict[pname] = convert_pdc(pdcs[5], p)
-#         elif 'block2_3.conv1.weight' in pname:
-#             new_dict[pname] = convert_pdc(pdcs[6], p)
-#         elif 'block2_4.conv1.weight' in pname:
-#             new_dict[pname] = convert_pdc(pdcs[7], p)
-#         elif 'block3_1.conv1.weight' in pname:
-#             new_dict[pname] = convert_pdc(pdcs[8], p)
-#         elif 'block3_2.conv1.weight' in pname:
-#             new_dict[pname] = convert_pdc(pdcs[9], p)
-#         elif 'block3_3.conv1.weight' in pname:
-#             new_dict[pname] = convert_pdc(pdcs[10], p)
-#         elif 'block3_4.conv1.weight' in pname:
-#             new_dict[pname] = convert_pdc(pdcs[11], p)
-#         elif 'block4_1.conv1.weight' in pname:
-#             new_dict[pname] = convert_pdc(pdcs[12], p)
-#         elif 'block4_2.conv1.weight' in pname:
-#             new_dict[pname] = convert_pdc(pdcs[13], p)
-#         elif 'block4_3.conv1.weight' in pname:
-#             new_dict[pname] = convert_pdc(pdcs[14], p)
-#         elif 'block4_4.conv1.weight' in pname:
-#             new_dict[pname] = convert_pdc(pdcs[15], p)
-#         else:
-#             new_dict[pname] = p
-#     return new_dict
-
-
-class conv_nd(nn.Cell):
-    def __init__(self, dims, *args, **kwargs):
-        super().__init__()
-        if dims == 1:
-            self.conv = nn.Conv1d(*args, **kwargs)
-        elif dims == 2:
-            self.conv = nn.Conv2d(*args, **kwargs)
-        elif dims == 3:
-            self.conv = nn.Conv3d(*args, **kwargs)
+def convert_pidinet(state_dict, config):
+    pdcs = config_model_converted(config)
+    new_dict = {}
+    for pname, p in state_dict.items():
+        if "init_block.weight" in pname:
+            new_dict[pname] = convert_pdc(pdcs[0], p)
+        elif "block1_1.conv1.weight" in pname:
+            new_dict[pname] = convert_pdc(pdcs[1], p)
+        elif "block1_2.conv1.weight" in pname:
+            new_dict[pname] = convert_pdc(pdcs[2], p)
+        elif "block1_3.conv1.weight" in pname:
+            new_dict[pname] = convert_pdc(pdcs[3], p)
+        elif "block2_1.conv1.weight" in pname:
+            new_dict[pname] = convert_pdc(pdcs[4], p)
+        elif "block2_2.conv1.weight" in pname:
+            new_dict[pname] = convert_pdc(pdcs[5], p)
+        elif "block2_3.conv1.weight" in pname:
+            new_dict[pname] = convert_pdc(pdcs[6], p)
+        elif "block2_4.conv1.weight" in pname:
+            new_dict[pname] = convert_pdc(pdcs[7], p)
+        elif "block3_1.conv1.weight" in pname:
+            new_dict[pname] = convert_pdc(pdcs[8], p)
+        elif "block3_2.conv1.weight" in pname:
+            new_dict[pname] = convert_pdc(pdcs[9], p)
+        elif "block3_3.conv1.weight" in pname:
+            new_dict[pname] = convert_pdc(pdcs[10], p)
+        elif "block3_4.conv1.weight" in pname:
+            new_dict[pname] = convert_pdc(pdcs[11], p)
+        elif "block4_1.conv1.weight" in pname:
+            new_dict[pname] = convert_pdc(pdcs[12], p)
+        elif "block4_2.conv1.weight" in pname:
+            new_dict[pname] = convert_pdc(pdcs[13], p)
+        elif "block4_3.conv1.weight" in pname:
+            new_dict[pname] = convert_pdc(pdcs[14], p)
+        elif "block4_4.conv1.weight" in pname:
+            new_dict[pname] = convert_pdc(pdcs[15], p)
         else:
-            raise ValueError(f"unsupported dimensions: {dims}")
-
-    def construct(self, x, emb=None, context=None):
-        x = self.conv(x)
-        return x
+            new_dict[pname] = p
+    return new_dict
 
 
 class Conv2d(nn.Cell):
@@ -149,24 +134,20 @@ class Conv2d(nn.Cell):
         self.padding = padding
         self.dilation = dilation
         self.groups = groups
-
-        self.reset_parameters(bias)
-        self.pdc = pdc
-
-    def reset_parameters(self, bias):
-        self.weight = Parameter(
-            initializer(
-                HeUniform(math.sqrt(5)),
-                (self.out_channels, self.in_channels // self.groups, self.kernel_size, self.kernel_size),
-                ms.float32,
-            )
-        )
+        self.weight = Parameter(initializer("normal", (out_channels, in_channels // groups, kernel_size, kernel_size)))
         if bias:
-            fan_in = self.in_channels // self.groups * self.kernel_size * self.kernel_size
-            bound = 1 / math.sqrt(fan_in)
-            self.bias = Parameter(initializer(Uniform(scale=bound), (self.out_channels,), ms.float32))
+            self.bias = Parameter(initializer("zeros", (out_channels,)))
         else:
             self.bias = None
+        self.reset_parameters()
+        self.pdc = pdc
+
+    def reset_parameters(self):
+        self.weight.set_data(initializer(HeUniform(math.sqrt(5)), self.weight.shape, self.weight.dtype))
+        if self.bias is not None:
+            fan_in = self.in_channels // self.groups * self.kernel_size * self.kernel_size
+            bound = 1 / math.sqrt(fan_in)
+            self.bias.set_data(initializer(Uniform(scale=bound), self.bias.shape, self.bias.dtype))
 
     def construct(self, input):
         return self.pdc(input, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
@@ -182,10 +163,10 @@ class CSAM(nn.Cell):
 
         mid_channels = 4
         self.relu1 = nn.ReLU()
-        self.conv1 = conv_nd(2, channels, mid_channels, kernel_size=1, padding=0, has_bias=True, pad_mode="pad")
-        self.conv2 = conv_nd(2, mid_channels, 1, kernel_size=3, padding=1, has_bias=False, pad_mode="pad")
+        self.conv1 = nn.Conv2d(channels, mid_channels, kernel_size=1, padding=0, has_bias=True, pad_mode="pad")
+        self.conv2 = nn.Conv2d(mid_channels, 1, kernel_size=3, padding=1, has_bias=False, pad_mode="pad")
         self.sigmoid = nn.Sigmoid()
-        self.conv1.conv.bias = Parameter(initializer(Constant(0), self.conv1.conv.bias.shape, ms.float32))
+        self.conv1.bias.set_data(initializer(Constant(0), self.conv1.bias.shape, self.conv1.bias.dtype))
 
     def construct(self, x):
         y = self.relu1(x)
@@ -205,20 +186,20 @@ class CDCM(nn.Cell):
         super(CDCM, self).__init__()
 
         self.relu1 = nn.ReLU()
-        self.conv1 = conv_nd(2, in_channels, out_channels, kernel_size=1, padding=0, has_bias=True, pad_mode="pad")
-        self.conv2_1 = conv_nd(
-            2, out_channels, out_channels, kernel_size=3, dilation=5, padding=5, has_bias=False, pad_mode="pad"
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=1, padding=0, has_bias=True, pad_mode="pad")
+        self.conv2_1 = nn.Conv2d(
+            out_channels, out_channels, kernel_size=3, dilation=5, padding=5, has_bias=False, pad_mode="pad"
         )
-        self.conv2_2 = conv_nd(
-            2, out_channels, out_channels, kernel_size=3, dilation=7, padding=7, has_bias=False, pad_mode="pad"
+        self.conv2_2 = nn.Conv2d(
+            out_channels, out_channels, kernel_size=3, dilation=7, padding=7, has_bias=False, pad_mode="pad"
         )
-        self.conv2_3 = conv_nd(
-            2, out_channels, out_channels, kernel_size=3, dilation=9, padding=9, has_bias=False, pad_mode="pad"
+        self.conv2_3 = nn.Conv2d(
+            out_channels, out_channels, kernel_size=3, dilation=9, padding=9, has_bias=False, pad_mode="pad"
         )
-        self.conv2_4 = conv_nd(
-            2, out_channels, out_channels, kernel_size=3, dilation=11, padding=11, has_bias=False, pad_mode="pad"
+        self.conv2_4 = nn.Conv2d(
+            out_channels, out_channels, kernel_size=3, dilation=11, padding=11, has_bias=False, pad_mode="pad"
         )
-        self.conv1.conv.bias = Parameter(initializer(Constant(0), self.conv1.conv.bias.shape, ms.float32))
+        self.conv1.bias.set_data(initializer(Constant(0), self.conv1.bias.shape, self.conv1.bias.dtype))
 
     def construct(self, x):
         x = self.relu1(x)
@@ -237,9 +218,8 @@ class MapReduce(nn.Cell):
 
     def __init__(self, channels):
         super(MapReduce, self).__init__()
-        self.conv = conv_nd(2, channels, 1, kernel_size=1, padding=0, has_bias=True, pad_mode="pad")
-
-        self.conv.conv.bias = Parameter(initializer(Constant(0), self.conv.conv.bias.shape, ms.float32))
+        self.conv = nn.Conv2d(channels, 1, kernel_size=1, padding=0, has_bias=True, pad_mode="pad")
+        self.conv.bias.set_data(initializer(Constant(0), self.conv.bias.shape, self.conv.bias.dtype))
 
     def construct(self, x):
         return self.conv(x)
@@ -252,10 +232,10 @@ class PDCBlock(nn.Cell):
         self.stride = stride
         if self.stride > 1:
             self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
-            self.shortcut = conv_nd(2, inplane, ouplane, kernel_size=1, padding=0, has_bias=True, pad_mode="pad")
+            self.shortcut = nn.Conv2d(inplane, ouplane, kernel_size=1, padding=0, has_bias=True, pad_mode="pad")
         self.conv1 = Conv2d(pdc, inplane, inplane, kernel_size=3, padding=1, groups=inplane, bias=False)
         self.relu2 = nn.ReLU()
-        self.conv2 = conv_nd(2, inplane, ouplane, kernel_size=1, padding=0, has_bias=False, pad_mode="pad")
+        self.conv2 = nn.Conv2d(inplane, ouplane, kernel_size=1, padding=0, has_bias=False, pad_mode="pad")
 
     def construct(self, x):
         if self.stride > 1:
@@ -281,17 +261,17 @@ class PDCBlock_converted(nn.Cell):
 
         if self.stride > 1:
             self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
-            self.shortcut = conv_nd(2, inplane, ouplane, kernel_size=1, padding=0, has_bias=True, pad_mode="pad")
+            self.shortcut = nn.Conv2d(inplane, ouplane, kernel_size=1, padding=0, has_bias=True, pad_mode="pad")
         if pdc == "rd":
-            self.conv1 = conv_nd(
-                2, inplane, inplane, kernel_size=5, padding=2, group=inplane, has_bias=False, pad_mode="pad"
+            self.conv1 = nn.Conv2d(
+                inplane, inplane, kernel_size=5, padding=2, group=inplane, has_bias=False, pad_mode="pad"
             )
         else:
-            self.conv1 = conv_nd(
-                2, inplane, inplane, kernel_size=3, padding=1, group=inplane, has_bias=False, pad_mode="pad"
+            self.conv1 = nn.Conv2d(
+                inplane, inplane, kernel_size=3, padding=1, group=inplane, has_bias=False, pad_mode="pad"
             )
         self.relu2 = nn.ReLU()
-        self.conv2 = conv_nd(2, inplane, ouplane, kernel_size=1, padding=0, has_bias=False, pad_mode="pad")
+        self.conv2 = nn.Conv2d(inplane, ouplane, kernel_size=1, padding=0, has_bias=False, pad_mode="pad")
 
     def construct(self, x):
         if self.stride > 1:
@@ -323,8 +303,8 @@ class PiDiNet(nn.Cell):
             else:
                 init_kernel_size = 3
                 init_padding = 1
-            self.init_block = conv_nd(
-                2, 3, self.inplane, kernel_size=init_kernel_size, padding=init_padding, has_bias=False, pad_mode="pad"
+            self.init_block = nn.Conv2d(
+                3, self.inplane, kernel_size=init_kernel_size, padding=init_padding, has_bias=False, pad_mode="pad"
             )
             block_class = PDCBlock_converted
         else:
@@ -371,11 +351,13 @@ class PiDiNet(nn.Cell):
         else:
             self.conv_reduces = nn.CellList([MapReduce(self.fuseplanes[i]) for i in range(4)])
 
-        self.classifier = conv_nd(2, 4, 1, kernel_size=1, has_bias=True, pad_mode="pad")
-        self.classifier.conv.weight = Parameter(
-            initializer(Constant(0.25), self.classifier.conv.weight.shape, ms.float32)
+        self.classifier = nn.Conv2d(4, 1, kernel_size=1, has_bias=True, pad_mode="pad")
+        self.classifier.weight.set_data(
+            initializer(Constant(0.25), self.classifier.weight.shape, self.classifier.weight.dtype)
         )
-        self.classifier.conv.bias = Parameter(initializer(Constant(0.0), self.classifier.conv.bias.shape, ms.float32))
+        self.classifier.bias.set_data(
+            initializer(Constant(0.0), self.classifier.bias.shape, self.classifier.bias.dtype)
+        )
 
     def construct(self, x):
         H, W = x.shape[2:]
@@ -434,27 +416,20 @@ class PiDiNet(nn.Cell):
         return outputs[-1]
 
 
-def pidinet_bsd(pretrained=False, ckpt_path=None, vanilla_cnn=True):
+def pidinet_bsd(pretrained=False, vanilla_cnn=True, ckpt_path=None):
     assert vanilla_cnn is True, "vanilla_cnn only support True for now!"
     pdcs = config_model_converted("carv4")
     model = PiDiNet(60, pdcs, dil=24, sa=True, convert=vanilla_cnn)
 
-    if pretrained:
-        if ckpt_path is not None:
-            assert os.path.isfile(ckpt_path), "{} must exist".format(ckpt_path)
-        else:
-            ckpt_path = os.path.join(os.path.dirname(__file__), "./model_weights/pidinet_ms.ckpt")
-        state = ms.load_checkpoint(ckpt_path)
-        if "state_dict" in state:
-            state = state["state_dict"]
+    def remove_prefix(sd):
+        prefix = "module."
+        return {k[len(prefix) :] if k.startswith(prefix) else k: v for k, v in sd.items()}
 
-        for pname, p in model.parameters_and_names():
-            if p.name != pname and (p.name not in state and pname in state):
-                param = state.pop(pname)
-                state[p.name] = param  # classifier.conv.weight -> weight; classifier.conv.bias -> bias
-        param_not_load, _ = ms.load_param_into_net(model, state)
-        if len(param_not_load):
-            print("Params not load: {}".format(param_not_load))
+    if pretrained:
+        if vanilla_cnn:
+            load_pt_weights_in_model(model, ckpt_path, (partial(convert_pidinet, config="carv4"), remove_prefix))
+        else:
+            load_pt_weights_in_model(model, ckpt_path, (remove_prefix,))
     return model
 
 

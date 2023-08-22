@@ -171,3 +171,6 @@ dmypy.json
 rank_*/
 output/
 outputs/
+
+# weights
+model_weights/

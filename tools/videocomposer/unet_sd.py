@@ -1,4 +1,5 @@
 import math
+import os
 from functools import partial
 from typing import Any, Optional
 
@@ -8,16 +9,20 @@ import mindspore as ms
 import mindspore.common.initializer as init
 from mindspore import nn, ops
 
-from .mha_flash import FlashAttentionBlock
+from utils.pt2ms import load_pt_weights_in_model
+
+# from .mha_flash import FlashAttentionBlock
 from .rotary_embedding import RotaryEmbedding
 
 __all__ = ["UNetSD_temporal"]
 
 USE_TEMPORAL_TRANSFORMER = True
+_USE_MEMORY_EFFICIENT_ATTENTION = int(os.environ.get("USE_MEMORY_EFFICIENT_ATTENTION", 0)) == 1
+_ATTN_PRECISION = os.environ.get("ATTN_PRECISION", "fp32")
 
 
 # load all keys started with prefix and replace them with new_prefix
-def load_Block(state, prefix, new_prefix=None):
+def load_block(state, prefix, new_prefix=None):
     if new_prefix is None:
         new_prefix = prefix
 
@@ -53,16 +58,16 @@ def load_2d_pretrained_state_dict(state, cfg):
     scale = 1.0
 
     # embeddings
-    state_dict = load_Block(state, prefix=f"time_embedding")
+    state_dict = load_block(state, prefix=f"time_embedding")
     new_state_dict.update(state_dict)
-    state_dict = load_Block(state, prefix=f"y_embedding")
+    state_dict = load_block(state, prefix=f"y_embedding")
     new_state_dict.update(state_dict)
-    state_dict = load_Block(state, prefix=f"context_embedding")
+    state_dict = load_block(state, prefix=f"context_embedding")
     new_state_dict.update(state_dict)
 
     encoder_idx = 0
     # init block
-    state_dict = load_Block(state, prefix=f"encoder.{encoder_idx}", new_prefix=f"encoder.{encoder_idx}.0")
+    state_dict = load_block(state, prefix=f"encoder.{encoder_idx}", new_prefix=f"encoder.{encoder_idx}.0")
     new_state_dict.update(state_dict)
     encoder_idx += 1
 
@@ -73,7 +78,7 @@ def load_2d_pretrained_state_dict(state, cfg):
             idx = 0
             idx_ = 0
             # residual (+attention) blocks
-            state_dict = load_Block(
+            state_dict = load_block(
                 state, prefix=f"encoder.{encoder_idx}.{idx}", new_prefix=f"encoder.{encoder_idx}.{idx_}"
             )
             new_state_dict.update(state_dict)
@@ -82,7 +87,7 @@ def load_2d_pretrained_state_dict(state, cfg):
 
             if scale in attn_scales:
                 # block.append(AttentionBlock(out_dim, context_dim, num_heads, head_dim))
-                state_dict = load_Block(
+                state_dict = load_block(
                     state, prefix=f"encoder.{encoder_idx}.{idx}", new_prefix=f"encoder.{encoder_idx}.{idx_}"
                 )
                 new_state_dict.update(state_dict)
@@ -95,7 +100,7 @@ def load_2d_pretrained_state_dict(state, cfg):
             # downsample
             if i != len(dim_mult) - 1 and j == num_res_blocks - 1:
                 # downsample = ResidualBlock(out_dim, embed_dim, out_dim, use_scale_shift_norm, 0.5, dropout)
-                state_dict = load_Block(state, prefix=f"encoder.{encoder_idx}", new_prefix=f"encoder.{encoder_idx}.0")
+                state_dict = load_block(state, prefix=f"encoder.{encoder_idx}", new_prefix=f"encoder.{encoder_idx}.0")
                 new_state_dict.update(state_dict)
 
                 shortcut_dims.append(out_dim)
@@ -105,11 +110,11 @@ def load_2d_pretrained_state_dict(state, cfg):
     # middle
     middle_idx = 0
 
-    state_dict = load_Block(state, prefix=f"middle.{middle_idx}")
+    state_dict = load_block(state, prefix=f"middle.{middle_idx}")
     new_state_dict.update(state_dict)
     middle_idx += 2
 
-    state_dict = load_Block(state, prefix=f"middle.1", new_prefix=f"middle.{middle_idx}")
+    state_dict = load_block(state, prefix=f"middle.1", new_prefix=f"middle.{middle_idx}")
     new_state_dict.update(state_dict)
     middle_idx += 1
 
@@ -117,7 +122,7 @@ def load_2d_pretrained_state_dict(state, cfg):
         # self.middle.append(TemporalAttentionBlock(out_dim, num_heads, head_dim, rotary_emb =  self.rotary_emb))
         middle_idx += 1
 
-    state_dict = load_Block(state, prefix=f"middle.2", new_prefix=f"middle.{middle_idx}")
+    state_dict = load_block(state, prefix=f"middle.2", new_prefix=f"middle.{middle_idx}")
     new_state_dict.update(state_dict)
     middle_idx += 2
 
@@ -127,7 +132,7 @@ def load_2d_pretrained_state_dict(state, cfg):
             idx = 0
             idx_ = 0
             # residual (+attention) blocks
-            state_dict = load_Block(
+            state_dict = load_block(
                 state, prefix=f"decoder.{decoder_idx}.{idx}", new_prefix=f"decoder.{decoder_idx}.{idx_}"
             )
             new_state_dict.update(state_dict)
@@ -135,7 +140,7 @@ def load_2d_pretrained_state_dict(state, cfg):
             idx_ += 2
             if scale in attn_scales:
                 # block.append(AttentionBlock(out_dim, context_dim, num_heads, head_dim))
-                state_dict = load_Block(
+                state_dict = load_block(
                     state, prefix=f"decoder.{decoder_idx}.{idx}", new_prefix=f"decoder.{decoder_idx}.{idx_}"
                 )
                 new_state_dict.update(state_dict)
@@ -149,7 +154,7 @@ def load_2d_pretrained_state_dict(state, cfg):
             # upsample
             if i != len(dim_mult) - 1 and j == num_res_blocks:
                 # upsample = ResidualBlock(out_dim, embed_dim, out_dim, use_scale_shift_norm, 2.0, dropout)
-                state_dict = load_Block(
+                state_dict = load_block(
                     state, prefix=f"decoder.{decoder_idx}.{idx}", new_prefix=f"decoder.{decoder_idx}.{idx_}"
                 )
                 new_state_dict.update(state_dict)
@@ -161,10 +166,20 @@ def load_2d_pretrained_state_dict(state, cfg):
             # self.decoder.append(block)
             decoder_idx += 1
 
-    state_dict = load_Block(state, prefix=f"head")
+    state_dict = load_block(state, prefix=f"head")
     new_state_dict.update(state_dict)
 
     return new_state_dict
+
+
+def exists(x):
+    return x is not None
+
+
+def default(val, d):
+    if exists(val):
+        return val
+    return d() if callable(d) else d
 
 
 def sinusoidal_embedding(timesteps, dim):
@@ -180,16 +195,6 @@ def sinusoidal_embedding(timesteps, dim):
     return x
 
 
-def exists(x):
-    return x is not None
-
-
-def default(val, d):
-    if exists(val):
-        return val
-    return d() if callable(d) else d
-
-
 def prob_mask_like(shape, prob):
     if prob == 1:
         return ops.ones(shape, dtype=ms.bool_)
@@ -203,14 +208,64 @@ def prob_mask_like(shape, prob):
         return mask
 
 
+def conv_nd(dims, *args, **kwargs):
+    """
+    Create a 1D, 2D, or 3D convolution module.
+    """
+    if dims == 1:
+        return nn.Conv1d(*args, **kwargs)
+    elif dims == 2:
+        return nn.Conv2d(*args, **kwargs)
+    elif dims == 3:
+        return nn.Conv3d(*args, **kwargs)
+    raise ValueError(f"unsupported dimensions: {dims}")
+
+
+def linear(*args, **kwargs):
+    """
+    Create a linear module.
+    """
+    return nn.Dense(*args, **kwargs)
+
+
+def avg_pool_nd(dims, *args, **kwargs):
+    """
+    Create a 1D, 2D, or 3D average pooling module.
+    """
+    if dims == 1:
+        return nn.AvgPool1d(*args, **kwargs)
+    elif dims == 2:
+        return nn.AvgPool2d(*args, **kwargs)
+    elif dims == 3:
+        return nn.AvgPool3d(*args, **kwargs)
+    raise ValueError(f"unsupported dimensions: {dims}")
+
+
+def zero_module(module):
+    """
+    Zero out the parameters of a module and return it.
+    """
+    for p in module.get_parameters():
+        p.set_data(init.initializer("zeros", p.shape, p.dtype))
+    return module
+
+
+class GroupNorm(nn.GroupNorm):
+    def __init__(self, num_groups, num_channels, eps=1e-5, affine=True):
+        super().__init__(num_groups=num_groups, num_channels=num_channels, eps=eps, affine=affine)
+
+    def construct(self, x):
+        x_shape = x.shape
+        if x.ndim >= 3:
+            x = x.view(x_shape[0], x_shape[1], x_shape[2], -1)
+        y = super().construct(x)
+        return y.view(x_shape)
+
+
 class MemoryEfficientCrossAttention(nn.Cell):
     # https://github.com/MatthieuTPHR/diffusers/blob/d80b531ff8060ec1ea982b65a1b8df70f73aa67c/src/diffusers/models/attention.py#L223
     def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.0):
         super().__init__()
-        print(
-            f"Setting up {self.__class__.__name__}. Query dim is {query_dim}, context_dim is {context_dim} and using "
-            f"{heads} heads."
-        )
         inner_dim = dim_head * heads
         context_dim = default(context_dim, query_dim)
 
@@ -319,7 +374,7 @@ class SpatialTransformer(nn.Cell):
             context_dim = [context_dim]
         self.in_channels = in_channels
         inner_dim = n_heads * d_head
-        self.norm = nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
+        self.norm = GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
         if not use_linear:
             self.proj_in = nn.Conv2d(in_channels, inner_dim, kernel_size=1, stride=1, padding=0, has_bias=True)
         else:
@@ -334,7 +389,7 @@ class SpatialTransformer(nn.Cell):
                     dropout=dropout,
                     context_dim=context_dim[d],
                     disable_self_attn=disable_self_attn,
-                    checkpoint=use_checkpoint,
+                    use_checkpoint=use_checkpoint,
                 )
                 for d in range(depth)
             ]
@@ -371,11 +426,6 @@ class SpatialTransformer(nn.Cell):
         if not self.use_linear:
             x = self.proj_out(x)
         return x + x_in
-
-
-import os
-
-_ATTN_PRECISION = os.environ.get("ATTN_PRECISION", "fp32")
 
 
 class CrossAttention(nn.Cell):
@@ -423,7 +473,7 @@ class CrossAttention(nn.Cell):
             sim.masked_fill_(~mask, max_neg_value)
 
         # attention, what we cannot get enough of
-        sim = sim.softmax(dim=-1)
+        sim = ops.softmax(sim, axis=-1)
 
         out = ops.bmm(sim, v)
         # (b h) n d -> b h n d -> b n h d -> b n (h d)
@@ -446,14 +496,13 @@ class BasicTransformerBlock(nn.Cell):
         dropout=0.0,
         context_dim=None,
         gated_ff=True,
-        checkpoint=True,
+        use_checkpoint=True,
         disable_self_attn=False,
     ):
         super().__init__()
-        # attn_mode = "softmax-xformers" if XFORMERS_IS_AVAILBLE else "softmax"
-        # assert attn_mode in self.ATTENTION_MODES
-        # attn_cls = CrossAttention
-        attn_cls = MemoryEfficientCrossAttention
+        # attn_mode = "softmax-xformers" if XFORMERS_IS_AVAILABLE else "softmax"
+        attn_cls = CrossAttention
+        # attn_cls = MemoryEfficientCrossAttention
         self.disable_self_attn = disable_self_attn
         self.attn1 = attn_cls(
             query_dim=dim,
@@ -466,13 +515,13 @@ class BasicTransformerBlock(nn.Cell):
         self.attn2 = attn_cls(
             query_dim=dim, context_dim=context_dim, heads=n_heads, dim_head=d_head, dropout=dropout
         )  # is self-attn if context is none
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-        self.norm3 = nn.LayerNorm(dim)
-        self.checkpoint = checkpoint
+        self.norm1 = nn.LayerNorm((dim,))
+        self.norm2 = nn.LayerNorm((dim,))
+        self.norm3 = nn.LayerNorm((dim,))
+        self.use_checkpoint = use_checkpoint
 
     def forward_(self, x, context=None):
-        return checkpoint(self._forward, (x, context), self.parameters(), self.checkpoint)
+        return checkpoint(self._forward, (x, context), self.parameters(), self.use_checkpoint)
 
     def construct(self, x, context=None):
         x = self.attn1(self.norm1(x), context=context if self.disable_self_attn else None) + x
@@ -490,48 +539,6 @@ class GEGLU(nn.Cell):
     def construct(self, x):
         x, gate = self.proj(x).chunk(2, axis=-1)
         return x * ops.gelu(gate)
-
-
-def conv_nd(dims, *args, **kwargs):
-    """
-    Create a 1D, 2D, or 3D convolution module.
-    """
-    if dims == 1:
-        return nn.Conv1d(*args, **kwargs)
-    elif dims == 2:
-        return nn.Conv2d(*args, **kwargs)
-    elif dims == 3:
-        return nn.Conv3d(*args, **kwargs)
-    raise ValueError(f"unsupported dimensions: {dims}")
-
-
-def linear(*args, **kwargs):
-    """
-    Create a linear module.
-    """
-    return nn.Dense(*args, **kwargs)
-
-
-def avg_pool_nd(dims, *args, **kwargs):
-    """
-    Create a 1D, 2D, or 3D average pooling module.
-    """
-    if dims == 1:
-        return nn.AvgPool1d(*args, **kwargs)
-    elif dims == 2:
-        return nn.AvgPool2d(*args, **kwargs)
-    elif dims == 3:
-        return nn.AvgPool3d(*args, **kwargs)
-    raise ValueError(f"unsupported dimensions: {dims}")
-
-
-def zero_module(module):
-    """
-    Zero out the parameters of a module and return it.
-    """
-    for p in module.get_parameters():
-        p.set_data(init.initializer("zeros", p.shape, p.dtype))
-    return module
 
 
 class FeedForward(nn.Cell):
@@ -570,7 +577,7 @@ class Upsample(nn.Cell):
         if self.dims == 3:
             x = ops.interpolate(x, (x.shape[2], x.shape[3] * 2, x.shape[4] * 2), mode="nearest")
         else:
-            x = ops.interpolate(x, scale_factor=2, mode="nearest")
+            x = ops.interpolate(x, (x.shape[2] * 2, x.shape[3] * 2), mode="nearest")
         if self.use_conv:
             x = self.conv(x)
         return x
@@ -616,7 +623,7 @@ class ResBlock(nn.Cell):
         self.use_temporal_conv = use_temporal_conv
 
         self.in_layers = nn.SequentialCell(
-            nn.GroupNorm(32, channels),
+            GroupNorm(32, channels),
             nn.SiLU(),
             nn.Conv2d(channels, self.out_channels, 3, pad_mode="pad", padding=1, has_bias=True),
         )
@@ -640,7 +647,7 @@ class ResBlock(nn.Cell):
             ),
         )
         self.out_layers = nn.SequentialCell(
-            nn.GroupNorm(32, self.out_channels),
+            GroupNorm(32, self.out_channels),
             nn.SiLU(),
             nn.Dropout(p=dropout),
             zero_module(nn.Conv2d(self.out_channels, self.out_channels, 3, pad_mode="pad", padding=1, has_bias=True)),
@@ -656,10 +663,10 @@ class ResBlock(nn.Cell):
             self.skip_connection = nn.Conv2d(channels, self.out_channels, 1, has_bias=True)
 
         if self.use_temporal_conv:
-            self.temopral_conv = TemporalConvBlock_v2(
+            self.temporal_conv = TemporalConvBlockV2(
                 self.out_channels, self.out_channels, dropout=0.1, use_image_dataset=use_image_dataset
             )
-            # self.temopral_conv_2 = TemporalConvBlock(self.out_channels, self.out_channels, dropout=0.1, use_image_dataset=use_image_dataset)
+            # self.temporal_conv_2 = TemporalConvBlock(self.out_channels, self.out_channels, dropout=0.1, use_image_dataset=use_image_dataset)
 
     def construct(self, x, emb, batch_size):
         """
@@ -693,8 +700,8 @@ class ResBlock(nn.Cell):
             # (b f) c h w -> b f c h w -> b c f h w
             h = ops.reshape(h, (batch_size, h.shape[0] // batch_size, *h.shape[1:]))
             h = ops.transpose(h, (0, 2, 1, 3, 4))
-            h = self.temopral_conv(h)
-            # h = self.temopral_conv_2(h)
+            h = self.temporal_conv(h)
+            # h = self.temporal_conv_2(h)
             # 'b c f h w -> b f c h w -> (b f) c h w
             h = ops.transpose(h, (0, 2, 1, 3, 4))
             h = ops.reshape(h, (-1, *h.shape[2:]))
@@ -758,14 +765,14 @@ class ResidualBlock(nn.Cell):
 
         # layers
         self.layer1 = nn.SequentialCell(
-            nn.GroupNorm(32, in_dim), nn.SiLU(), nn.Conv2d(in_dim, out_dim, 3, pad_mode="pad", padding=1, has_bias=True)
+            GroupNorm(32, in_dim), nn.SiLU(), nn.Conv2d(in_dim, out_dim, 3, pad_mode="pad", padding=1, has_bias=True)
         )
         self.resample = Resample(in_dim, in_dim, mode)
         self.embedding = nn.SequentialCell(
             nn.SiLU(), nn.Dense(embed_dim, out_dim * 2 if use_scale_shift_norm else out_dim)
         )
         self.layer2 = nn.SequentialCell(
-            nn.GroupNorm(32, out_dim),
+            GroupNorm(32, out_dim),
             nn.SiLU(),
             nn.Dropout(p=dropout),
             nn.Conv2d(out_dim, out_dim, 3, pad_mode="pad", padding=1, has_bias=True),
@@ -806,7 +813,7 @@ class AttentionBlock(nn.Cell):
         self.scale = math.pow(head_dim, -0.25)
 
         # layers
-        self.norm = nn.GroupNorm(32, dim)
+        self.norm = GroupNorm(32, dim)
         self.to_qkv = nn.Conv2d(dim, dim * 3, 1, has_bias=True)
         if context_dim is not None:
             self.context_kv = nn.Dense(context_dim, dim * 2)
@@ -858,7 +865,7 @@ class TemporalAttentionBlock(nn.Cell):
         self.heads = heads
         hidden_dim = dim_head * heads
 
-        self.norm = nn.GroupNorm(32, dim)
+        self.norm = GroupNorm(32, dim)
         self.rotary_emb = rotary_emb
         self.to_qkv = nn.Dense(dim, hidden_dim * 3)  # , bias = False)
         self.to_out = nn.Dense(hidden_dim, dim)  # , bias = False)
@@ -945,7 +952,7 @@ class TemporalAttentionBlock(nn.Cell):
         out = ops.bmm(attn, v)
         # ... h n d -> ... n h d -> ... n (h d)
         permute_idx = tuple(range(out.ndim - 3)) + (out.ndim - 2, out.ndim - 3, out.ndim - 1)
-        out = ops.transpose(out, (0, 1, 3, 2, 4))
+        out = ops.transpose(out, permute_idx)
         out = ops.reshape(out, (*out.shape[:-2], -1))
         out = self.to_out(out)
 
@@ -993,7 +1000,7 @@ class TemporalTransformer(nn.Cell):
             context_dim = [context_dim]
         self.in_channels = in_channels
         inner_dim = n_heads * d_head
-        self.norm = nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
+        self.norm = GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
         if not use_linear:
             self.proj_in = nn.Conv1d(in_channels, inner_dim, kernel_size=1, stride=1, padding=0, has_bias=True)
         else:
@@ -1004,7 +1011,12 @@ class TemporalTransformer(nn.Cell):
         self.transformer_blocks = nn.CellList(
             [
                 BasicTransformerBlock(
-                    inner_dim, n_heads, d_head, dropout=dropout, context_dim=context_dim[d], checkpoint=use_checkpoint
+                    inner_dim,
+                    n_heads,
+                    d_head,
+                    dropout=dropout,
+                    context_dim=context_dim[d],
+                    use_checkpoint=use_checkpoint,
                 )
                 for d in range(depth)
             ]
@@ -1053,12 +1065,12 @@ class TemporalTransformer(nn.Cell):
             x = ops.reshape(x, (b, x.shape[0] // b, *x.shape[1:]))
             x = ops.transpose(x, (0, 1, 3, 2))
             for i, block in enumerate(self.transformer_blocks):
-                # context[i] = repeat(context[i], '(b f) l con -> b (f r) l con', r=(h*w)//self.frames, f=self.frames).contiguous()
+                # context[i] = repeat(context[i], '(b f) l con -> b (f r) l con', r=(h*w)//self.frames, f=self.frames)
                 # (b f) l con -> b f l con
                 context[i] = ops.reshape(
                     context[i], (context[i].shape[0] // self.frames, self.frames, *context[i].shape[1:])
                 )  # todo: wtf frames
-                # calculate each batch one by one (since number in shape could not greater then 65,535 for some package)
+                # calculate each batch one by one (since number in shape could not greater than 65,535 for some package)
                 for j in range(b):
                     context_i_j = ops.tile(context[i][j], ((h * w) // self.frames, 1, 1))  # todo: wtf frames
                     x[j] = block(x[j], context=context_i_j)
@@ -1066,11 +1078,11 @@ class TemporalTransformer(nn.Cell):
         if self.use_linear:
             x = self.proj_out(x)
             # b (h w) f c -> b h w f c -> b f c h w
-            x = ops.reshape(x, (x.shape[0], h, w, x.shape[2:]))
+            x = ops.reshape(x, (x.shape[0], h, w, *x.shape[2:]))
             x = ops.transpose(x, (0, 3, 4, 1, 2))
         if not self.use_linear:
             # b hw f c -> (b hw) f c -> (b hw) c f
-            x = ops.reshape(x, (-1, x.shape[2:]))
+            x = ops.reshape(x, (-1, *x.shape[2:]))
             x = ops.transpose(x, (0, 2, 1))
             x = self.proj_out(x)
             # (b h w) c f -> b h w c f -> b c f h w
@@ -1120,10 +1132,10 @@ class InitTemporalConvBlock(nn.Cell):
 
         # conv layers
         self.conv = nn.SequentialCell(
-            nn.GroupNorm(32, out_dim),
+            GroupNorm(32, out_dim),
             nn.SiLU(),
             nn.Dropout(p=dropout),
-            nn.Conv3d(out_dim, in_dim, (3, 1, 1), pad_mode="pad", padding=(1, 0, 0), has_bias=True),
+            nn.Conv3d(out_dim, in_dim, (3, 1, 1), pad_mode="pad", padding=(1, 1, 0, 0, 0, 0), has_bias=True),
         )
 
         # zero out the last layer params,so the conv block is identity
@@ -1151,15 +1163,15 @@ class TemporalConvBlock(nn.Cell):
 
         # conv layers
         self.conv1 = nn.SequentialCell(
-            nn.GroupNorm(32, in_dim),
+            GroupNorm(32, in_dim),
             nn.SiLU(),
-            nn.Conv3d(in_dim, out_dim, (3, 1, 1), pad_mode="pad", padding=(1, 0, 0), has_bias=True),
+            nn.Conv3d(in_dim, out_dim, (3, 1, 1), pad_mode="pad", padding=(1, 1, 0, 0, 0, 0), has_bias=True),
         )
         self.conv2 = nn.SequentialCell(
-            nn.GroupNorm(32, out_dim),
+            GroupNorm(32, out_dim),
             nn.SiLU(),
             nn.Dropout(p=dropout),
-            nn.Conv3d(out_dim, in_dim, (3, 1, 1), pad_mode="pad", padding=(1, 0, 0), has_bias=True),
+            nn.Conv3d(out_dim, in_dim, (3, 1, 1), pad_mode="pad", padding=(1, 1, 0, 0, 0, 0), has_bias=True),
         )
 
         # zero out the last layer params,so the conv block is identity
@@ -1179,9 +1191,9 @@ class TemporalConvBlock(nn.Cell):
         return x
 
 
-class TemporalConvBlock_v2(nn.Cell):
+class TemporalConvBlockV2(nn.Cell):
     def __init__(self, in_dim, out_dim=None, dropout=0.0, use_image_dataset=False):
-        super(TemporalConvBlock_v2, self).__init__()
+        super(TemporalConvBlockV2, self).__init__()
         if out_dim is None:
             out_dim = in_dim  # int(1.5*in_dim)
         self.in_dim = in_dim
@@ -1190,27 +1202,27 @@ class TemporalConvBlock_v2(nn.Cell):
 
         # conv layers
         self.conv1 = nn.SequentialCell(
-            nn.GroupNorm(32, in_dim),
+            GroupNorm(32, in_dim),
             nn.SiLU(),
-            nn.Conv3d(in_dim, out_dim, (3, 1, 1), pad_mode="pad", padding=(1, 0, 0), has_bias=True),
+            nn.Conv3d(in_dim, out_dim, (3, 1, 1), pad_mode="pad", padding=(1, 1, 0, 0, 0, 0), has_bias=True),
         )
         self.conv2 = nn.SequentialCell(
-            nn.GroupNorm(32, out_dim),
+            GroupNorm(32, out_dim),
             nn.SiLU(),
             nn.Dropout(p=dropout),
-            nn.Conv3d(out_dim, in_dim, (3, 1, 1), pad_mode="pad", padding=(1, 0, 0), has_bias=True),
+            nn.Conv3d(out_dim, in_dim, (3, 1, 1), pad_mode="pad", padding=(1, 1, 0, 0, 0, 0), has_bias=True),
         )
         self.conv3 = nn.SequentialCell(
-            nn.GroupNorm(32, out_dim),
+            GroupNorm(32, out_dim),
             nn.SiLU(),
             nn.Dropout(p=dropout),
-            nn.Conv3d(out_dim, in_dim, (3, 1, 1), pad_mode="pad", padding=(1, 0, 0), has_bias=True),
+            nn.Conv3d(out_dim, in_dim, (3, 1, 1), pad_mode="pad", padding=(1, 1, 0, 0, 0, 0), has_bias=True),
         )
         self.conv4 = nn.SequentialCell(
-            nn.GroupNorm(32, out_dim),
+            GroupNorm(32, out_dim),
             nn.SiLU(),
             nn.Dropout(p=dropout),
-            nn.Conv3d(out_dim, in_dim, (3, 1, 1), pad_mode="pad", padding=(1, 0, 0), has_bias=True),
+            nn.Conv3d(out_dim, in_dim, (3, 1, 1), pad_mode="pad", padding=(1, 1, 0, 0, 0, 0), has_bias=True),
         )
 
         # zero out the last layer params,so the conv block is identity
@@ -1219,7 +1231,7 @@ class TemporalConvBlock_v2(nn.Cell):
         )
         self.conv4[-1].bias.set_data(init.initializer("zeros", self.conv4[-1].bias.shape, self.conv4[-1].bias.dtype))
 
-    def forward(self, x):
+    def construct(self, x):
         identity = x
         x = self.conv1(x)
         x = self.conv2(x)
@@ -1328,7 +1340,7 @@ class UNetSD_temporal(nn.Cell):
                 nn.SiLU(),
                 nn.Conv2d(concat_dim * 4, concat_dim, 3, stride=2, pad_mode="pad", padding=1, has_bias=True),
             )
-            self.depth_embedding_after = Transformer_v2(
+            self.depth_embedding_after = TransformerV2(
                 heads=2,
                 dim=concat_dim,
                 dim_head_k=concat_dim,
@@ -1348,7 +1360,7 @@ class UNetSD_temporal(nn.Cell):
                 nn.SiLU(),
                 nn.Conv2d(concat_dim * 4, concat_dim, 3, stride=2, pad_mode="pad", padding=1, has_bias=True),
             )
-            self.motion_embedding_after = Transformer_v2(
+            self.motion_embedding_after = TransformerV2(
                 heads=2,
                 dim=concat_dim,
                 dim_head_k=concat_dim,
@@ -1369,7 +1381,7 @@ class UNetSD_temporal(nn.Cell):
                 nn.SiLU(),
                 nn.Conv2d(concat_dim * 4, concat_dim, 3, stride=2, pad_mode="pad", padding=1, has_bias=True),
             )
-            self.canny_embedding_after = Transformer_v2(
+            self.canny_embedding_after = TransformerV2(
                 heads=2,
                 dim=concat_dim,
                 dim_head_k=concat_dim,
@@ -1394,7 +1406,7 @@ class UNetSD_temporal(nn.Cell):
                 if inpainting
                 else None
             )
-            self.mask_embedding_after = Transformer_v2(
+            self.mask_embedding_after = TransformerV2(
                 heads=2,
                 dim=concat_dim,
                 dim_head_k=concat_dim,
@@ -1415,7 +1427,7 @@ class UNetSD_temporal(nn.Cell):
                 nn.SiLU(),
                 nn.Conv2d(concat_dim * 4, concat_dim, 3, stride=2, pad_mode="pad", padding=1, has_bias=True),
             )
-            self.sketch_embedding_after = Transformer_v2(
+            self.sketch_embedding_after = TransformerV2(
                 heads=2,
                 dim=concat_dim,
                 dim_head_k=concat_dim,
@@ -1435,7 +1447,7 @@ class UNetSD_temporal(nn.Cell):
                 nn.SiLU(),
                 nn.Conv2d(concat_dim * 4, concat_dim, 3, stride=2, pad_mode="pad", padding=1, has_bias=True),
             )
-            self.single_sketch_embedding_after = Transformer_v2(
+            self.single_sketch_embedding_after = TransformerV2(
                 heads=2,
                 dim=concat_dim,
                 dim_head_k=concat_dim,
@@ -1455,7 +1467,7 @@ class UNetSD_temporal(nn.Cell):
                 nn.SiLU(),
                 nn.Conv2d(concat_dim * 4, concat_dim, 3, stride=2, pad_mode="pad", padding=1, has_bias=True),
             )
-            self.local_image_embedding_after = Transformer_v2(
+            self.local_image_embedding_after = TransformerV2(
                 heads=2,
                 dim=concat_dim,
                 dim_head_k=concat_dim,
@@ -1651,7 +1663,7 @@ class UNetSD_temporal(nn.Cell):
         for i, (in_dim, out_dim) in enumerate(zip(dec_dims[:-1], dec_dims[1:])):
             for j in range(num_res_blocks + 1):
                 # residual (+attention) blocks
-                # block = nn.ModuleList([ResidualBlock(in_dim + shortcut_dims.pop(), embed_dim, out_dim, use_scale_shift_norm, 'none')])
+                # block = [ResidualBlock(in_dim + shortcut_dims.pop(), embed_dim, out_dim, use_scale_shift_norm, 'none')]
                 block = [
                     ResBlock(
                         in_dim + shortcut_dims.pop(),
@@ -1707,7 +1719,7 @@ class UNetSD_temporal(nn.Cell):
                 # upsample
                 if i != len(dim_mult) - 1 and j == num_res_blocks:
                     # upsample = ResidualBlock(out_dim, embed_dim, out_dim, use_scale_shift_norm, 'upsample')
-                    upsample = Upsample(out_dim, True, dims=2.0, out_channels=out_dim)
+                    upsample = Upsample(out_dim, True, dims=2, out_channels=out_dim)
                     scale *= 2.0
                     block.append(upsample)
                     # block.append(TemporalConvBlock(out_dim,dropout=dropout,use_image_dataset=use_image_dataset))
@@ -1718,13 +1730,25 @@ class UNetSD_temporal(nn.Cell):
 
         # head
         self.out = nn.SequentialCell(
-            nn.GroupNorm(32, out_dim),
+            GroupNorm(32, out_dim),
             nn.SiLU(),
             nn.Conv2d(out_dim, self.out_dim, 3, pad_mode="pad", padding=1, has_bias=True),
         )
 
         # zero out the last layer params
         self.out[-1].weight.set_data(init.initializer("zeros", self.out[-1].weight.shape, self.out[-1].weight.dtype))
+
+    def load_state_dict(self, path, text_to_video_pretrain):
+        def prune_weights(sd):
+            return {key: p for key, p in sd.items() if "input_blocks.0.0" not in key}
+
+        def fix_typo(sd):
+            return {k.replace("temopral_conv", "temporal_conv"): v for k, v in sd.items()}
+
+        if text_to_video_pretrain:
+            load_pt_weights_in_model(self, path, (prune_weights, fix_typo))
+        else:
+            load_pt_weights_in_model(self, path, (fix_typo,))
 
     def construct(
         self,
@@ -1751,7 +1775,7 @@ class UNetSD_temporal(nn.Cell):
         batch, c, f, h, w = x.shape
         self.batch = batch
 
-        #### image and video joint training, if mask_last_frame_num is set, prob_focus_present will be ignored
+        # image and video joint training, if mask_last_frame_num is set, prob_focus_present will be ignored
         if mask_last_frame_num > 0:
             focus_present_mask = None
             video_mask[-mask_last_frame_num:] = False
@@ -1774,7 +1798,7 @@ class UNetSD_temporal(nn.Cell):
             index = ops.randperm(batch)
             zero[index[0:nzero]] = True
             keep[index[nzero : nzero + nkeep]] = True
-        assert not (zero & keep).any()
+        assert not zero.any() and not keep.any()
         misc_dropout = partial(self.misc_dropout, zero=zero, keep=keep)
 
         concat = x.new_zeros((batch, self.concat_dim, f, h, w))
@@ -1782,13 +1806,13 @@ class UNetSD_temporal(nn.Cell):
             # DropPath mask
             # b c f h w -> b f c h w -> (b f) c h w
             depth = ops.transpose(depth, (0, 2, 1, 3, 4))
-            depth - ops.reshape(depth, (-1, *depth.shape[2:]))
+            depth = ops.reshape(depth, (-1, *depth.shape[2:]))
             depth = self.depth_embedding(depth)
             h = depth.shape[2]
             # (b f) c h w -> b f c h w -> b h w f c -> (b h w) f c
             depth = ops.reshape(depth, (batch, depth.shape[0] // batch, *depth.shape[1:]))
             depth = ops.transpose(depth, (0, 3, 4, 1, 2))
-            depth = ops.reshape(depth, (-1, *depth[3:]))
+            depth = ops.reshape(depth, (-1, *depth.shape[3:]))
             depth = self.depth_embedding_after(depth)
 
             # (b h w) f c -> b h w f c -> b c f h w
@@ -1807,7 +1831,7 @@ class UNetSD_temporal(nn.Cell):
             # (b f) c h w -> b f c h w -> b h w f c -> (b h w) f c
             local_image = ops.reshape(local_image, (batch, local_image.shape[0] // batch, *local_image.shape[1:]))
             local_image = ops.transpose(local_image, (0, 3, 4, 1, 2))
-            local_image = ops.reshape(local_image, (-1, local_image.shape[3:]))
+            local_image = ops.reshape(local_image, (-1, *local_image.shape[3:]))
             local_image = self.local_image_embedding_after(local_image)
             # (b h w) f c -> b h w f c -> b c f h w
             local_image = ops.reshape(
@@ -1933,13 +1957,16 @@ class UNetSD_temporal(nn.Cell):
         else:
             e = self.time_embed(sinusoidal_embedding(t, self.dim))
 
-        context = x.new_zeros((batch, 0, self.context_dim))
+        # context = x.new_zeros((batch, 0, self.context_dim))
+        # we don't need context with shape (0,)
         if y is not None:
             y_context = misc_dropout(y)
-            context = ops.cat([context, y_context], axis=1)
+            # context = ops.cat([context, y_context], axis=1)
+            context = y_context
         else:
             y_context = self.zero_y.repeat(batch, 1, 1)
-            context = ops.cat([context, y_context], axis=1)
+            # context = ops.cat([context, y_context], axis=1)
+            context = y_context
 
         if image is not None:
             image_context = misc_dropout(self.pre_image_condition(image))
@@ -2059,24 +2086,14 @@ class UNetSD_temporal(nn.Cell):
         return x
 
 
-class PreNormattention(nn.Cell):
+class PreNormAttention(nn.Cell):
     def __init__(self, dim, fn):
         super().__init__()
-        self.norm = nn.LayerNorm(dim)
+        self.norm = nn.LayerNorm((dim,))
         self.fn = fn
 
     def construct(self, x, **kwargs):
         return self.fn(self.norm(x), **kwargs) + x
-
-
-class PreNormattention_qkv(nn.Cell):
-    def __init__(self, dim, fn):
-        super().__init__()
-        self.norm = nn.LayerNorm(dim)
-        self.fn = fn
-
-    def construct(self, q, k, v, **kwargs):
-        return self.fn(self.norm(q), self.norm(k), self.norm(v), **kwargs) + q
 
 
 class Attention(nn.Cell):
@@ -2118,62 +2135,7 @@ class Attention(nn.Cell):
         return self.to_out(out)
 
 
-class Attention_qkv(nn.Cell):
-    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0):
-        super().__init__()
-        inner_dim = dim_head * heads
-        project_out = not (heads == 1 and dim_head == dim)
-
-        self.heads = heads
-        self.scale = dim_head**-0.5
-
-        self.attend = nn.Softmax(axis=-1)
-        # self.to_qkv = nn.Linear(dim, inner_dim * 3, bias = False)
-        self.to_q = nn.Dense(dim, inner_dim, has_bias=False)
-        self.to_k = nn.Dense(dim, inner_dim, has_bias=False)
-        self.to_v = nn.Dense(dim, inner_dim, has_bias=False)
-
-        self.to_out = (
-            nn.SequentialCell(nn.Dense(inner_dim, dim), nn.Dropout(p=dropout)) if project_out else nn.Identity()
-        )
-
-    def construct(self, q, k, v):
-        b, n, _, h = *q.shape, self.heads
-        # qkv = self.to_qkv(x).chunk(3, dim = -1)
-        q = self.to_q(q)
-        k = self.to_k(k)
-        v = self.to_v(v)
-
-        def rearrange_qkv(tensor: ms.Tensor):
-            # b n (h d) -> b n h d -> b h n d
-            tensor = ops.reshape(tensor, (*tensor.shape[:2], h, tensor.shape[2] // h))
-            tensor = ops.transpose(tensor, (0, 2, 1, 3))
-            return tensor
-
-        q, k, v = map(rearrange_qkv, (q, k, v))
-
-        dots = ops.bmm(q, k.transpose(0, 1, 3, 2)) * self.scale
-
-        attn = self.attend(dots)  # [30, 8, 8, 5]
-
-        out = ops.bmm(attn, v)
-        # b h n d -> b n h d -> b n (h d)
-        out = ops.transpose(out, (0, 2, 1, 3))
-        out = ops.reshape(out, (*out.shape[:2], -1))
-        return self.to_out(out)
-
-
-class PostNormattention(nn.Cell):
-    def __init__(self, dim, fn):
-        super().__init__()
-        self.norm = nn.LayerNorm(dim)
-        self.fn = fn
-
-    def construct(self, x, **kwargs):
-        return self.norm(self.fn(x, **kwargs) + x)
-
-
-class Transformer_v2(nn.Cell):
+class TransformerV2(nn.Cell):
     def __init__(
         self,
         heads=8,
@@ -2192,9 +2154,7 @@ class Transformer_v2(nn.Cell):
             layers.append(
                 nn.CellList(
                     [
-                        # PreNormattention(2048, Attention(2048, heads = 8, dim_head = 256, dropout = 0.2))
-                        # PreNormattention(heads, dim, dim_head_k, dim_head_v, dropout=dropout_atte),
-                        PreNormattention(dim, Attention(dim, heads=heads, dim_head=dim_head_k, dropout=dropout_atte)),
+                        PreNormAttention(dim, Attention(dim, heads=heads, dim_head=dim_head_k, dropout=dropout_atte)),
                         FeedForward(dim, mlp_dim, dropout=dropout_ffn),
                     ]
                 )
@@ -2259,6 +2219,7 @@ if __name__ == "__main__":
 
     # [model] unet
     model = UNetSD_temporal(
+        cfg,
         in_dim=cfg.unet_in_dim,
         dim=cfg.unet_dim,
         y_dim=cfg.unet_y_dim,

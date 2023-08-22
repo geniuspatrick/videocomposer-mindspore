@@ -1,5 +1,6 @@
 import os
 import random
+import logging
 
 import cv2
 import imageio
@@ -10,12 +11,10 @@ import mindspore as ms
 from mindspore import ops
 from mindspore.dataset.vision import Inter, Resize
 
-import utils.logging as logging
-
 from ..annotator.mask import make_irregular_mask, make_rectangle_mask, make_uncrop
 from ..annotator.motion import extract_motion_vectors
 
-logger = logging.get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class VideoDataset(object):
@@ -77,20 +76,20 @@ class VideoDataset(object):
             except Exception as e:
                 print("{} get frames failed... with error: {}".format(video_key, e), flush=True)
 
-                ref_frame = ops.zeros((3, self.vit_image_size, self.vit_image_size))
+                ref_frame = np.zeros((3, self.vit_image_size, self.vit_image_size), dtype=np.float32)
                 # vit_image = ops.zeros((3, self.vit_image_size, self.vit_image_size))
-                video_data = ops.zeros((self.max_frames, 3, self.image_resolution, self.image_resolution))
-                misc_data = ops.zeros((self.max_frames, 3, self.misc_size, self.misc_size))
+                video_data = np.zeros((self.max_frames, 3, self.image_resolution, self.image_resolution), dtype=np.float32)
+                misc_data = np.zeros((self.max_frames, 3, self.misc_size, self.misc_size), dtype=np.float32)
 
-                mv_data = ops.zeros((self.max_frames, 2, self.image_resolution, self.image_resolution))
+                mv_data = np.zeros((self.max_frames, 2, self.image_resolution, self.image_resolution), dtype=np.float32)
         else:
             print("The video path does not exist or no video dir provided!")
-            ref_frame = ops.zeros((3, self.vit_image_size, self.vit_image_size))
+            ref_frame = np.zeros((3, self.vit_image_size, self.vit_image_size), dtype=np.float32)
             # vit_image = ops.zeros((3, self.vit_image_size, self.vit_image_size))
-            video_data = ops.zeros((self.max_frames, 3, self.image_resolution, self.image_resolution))
-            misc_data = ops.zeros((self.max_frames, 3, self.misc_size, self.misc_size))
+            video_data = np.zeros((self.max_frames, 3, self.image_resolution, self.image_resolution), dtype=np.float32)
+            misc_data = np.zeros((self.max_frames, 3, self.misc_size, self.misc_size), dtype=np.float32)
 
-            mv_data = ops.zeros((self.max_frames, 2, self.image_resolution, self.image_resolution))
+            mv_data = np.zeros((self.max_frames, 2, self.image_resolution, self.image_resolution), dtype=np.float32)
 
         # inpainting mask
         p = random.random()
@@ -100,11 +99,9 @@ class VideoDataset(object):
             mask = make_rectangle_mask(512, 512)
         else:
             mask = make_uncrop(512, 512)
-        mask = ms.Tensor(
-            cv2.resize(mask, (self.misc_size, self.misc_size), interpolation=cv2.INTER_NEAREST), ms.float32
-        ).unsqueeze(0)
-
-        mask = ops.repeat_interleave(mask.unsqueeze(0), repeats=self.max_frames, axis=0)
+        mask = cv2.resize(mask, (self.misc_size, self.misc_size), interpolation=cv2.INTER_NEAREST)
+        mask = np.expand_dims(np.expand_dims(mask, axis=0), axis=0)
+        mask = np.repeat(mask, repeats=self.max_frames, axis=0)
 
         return ref_frame, cap_txt, video_data, misc_data, feature_framerate, mask, mv_data
 
@@ -129,8 +126,7 @@ class VideoDataset(object):
 
         # note frames are in BGR mode, need to trans to RGB mode
         frames = [Image.fromarray(frames[i][:, :, ::-1]) for i in indices]
-        mvs = [ms.Tensor(mvs[i].permute(2, 0, 1)) for i in indices]
-        mvs = ops.stack(mvs)
+        mvs = [mvs[i].astype(np.float32) for i in indices]  # c, h, w
         # set_trace()
         # if mvs_visual != None:
         if visual_mv:
@@ -152,18 +148,17 @@ class VideoDataset(object):
         middle_indix = int(len(frames) / 2)
         if have_frames:
             ref_frame = frames[middle_indix]
-            vit_image = self.vit_transforms(ref_frame)
-            misc_imgs_np = self.misc_transforms[:2](frames)
-            misc_imgs = self.misc_transforms[2:](misc_imgs_np)
-            frames = self.transforms(frames)
-            mvs = self.mv_transforms(mvs)
+            vit_image = self.vit_transforms(ref_frame)[0]
+            misc_imgs = np.stack([self.misc_transforms(frame)[0] for frame in frames], axis=0)
+            frames = np.stack([self.transforms(frame)[0] for frame in frames], axis=0)
+            mvs = np.stack([self.mv_transforms(mv).transpose((2, 0, 1)) for mv in mvs], axis=0)
         else:
             # ref_frame = Image.fromarray(np.zeros((3, self.image_resolution, self.image_resolution)))
-            vit_image = ops.zeros((3, self.vit_image_size, self.vit_image_size))
+            vit_image = np.zeros((3, self.vit_image_size, self.vit_image_size), dtype=np.float32)
 
-        video_data = ops.zeros((self.max_frames, 3, self.image_resolution, self.image_resolution))
-        mv_data = ops.zeros((self.max_frames, 2, self.image_resolution, self.image_resolution))
-        misc_data = ops.zeros((self.max_frames, 3, self.misc_size, self.misc_size))
+        video_data = np.zeros((self.max_frames, 3, self.image_resolution, self.image_resolution), dtype=np.float32)
+        mv_data = np.zeros((self.max_frames, 2, self.image_resolution, self.image_resolution), dtype=np.float32)
+        misc_data = np.zeros((self.max_frames, 3, self.misc_size, self.misc_size), dtype=np.float32)
         if have_frames:
             video_data[: len(frames), ...] = frames  # [[XX...],[...], ..., [0,0...], [], ...]
             misc_data[: len(frames), ...] = misc_imgs
