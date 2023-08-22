@@ -40,7 +40,8 @@ class SelfAttention(nn.Cell):
         self.proj = nn.Dense(dim, dim)
 
     def construct(self, x):
-        b, l, c, n, d = *x.shape, self.num_heads, self.head_dim
+        b, l, c = x.shape
+        n, d = self.num_heads, self.head_dim
 
         # compute query, key, value
         q, k, v = self.to_qkv(x).view(b, l, n * 3, d).chunk(3, axis=2)
@@ -65,7 +66,7 @@ class GELU(nn.Cell):
         super(GELU, self).__init__()
 
     def construct(self, x):
-        return x * 0.5 * (1.0 + ops.erf(x / math.sqrt(2.0)))
+        return x * 0.5 * (1.0 + ops.erf(x / ops.sqrt(ms.Tensor(2.0))))
 
 
 class AttentionBlock(nn.Cell):
@@ -238,13 +239,11 @@ class MiDaS(nn.Cell):
 
         # blocks
         stride = num_layers // 4
-        self.blocks = nn.SequentialCell(
-            collections.OrderedDict([(str(i), AttentionBlock(dim, num_heads)) for i in range(num_layers)])
-        )
-        self.slices = [slice(i * stride, (i + 1) * stride) for i in range(4)]
+        self.blocks = [nn.SequentialCell([AttentionBlock(dim, num_heads) for _ in range(i * stride, (i + 1) * stride)]) for i in range(4)]
+        self.blocks = nn.CellList(self.blocks)
 
         # stage1 (4x)
-        self.fc1 = nn.SequentialCell(collections.OrderedDict([("0", nn.Dense(dim * 2, dim)), ("1", nn.GELU())]))
+        self.fc1 = nn.SequentialCell(collections.OrderedDict([("0", nn.Dense(dim * 2, dim)), ("1", GELU())]))
         self.conv1 = nn.SequentialCell(
             collections.OrderedDict(
                 [
@@ -257,7 +256,7 @@ class MiDaS(nn.Cell):
         self.fusion1 = FusionBlock(fusion_dim)
 
         # stage2 (8x)
-        self.fc2 = nn.SequentialCell(collections.OrderedDict([("0", nn.Dense(dim * 2, dim)), ("1", nn.GELU())]))
+        self.fc2 = nn.SequentialCell(collections.OrderedDict([("0", nn.Dense(dim * 2, dim)), ("1", GELU())]))
         self.conv2 = nn.SequentialCell(
             collections.OrderedDict(
                 [
@@ -270,7 +269,7 @@ class MiDaS(nn.Cell):
         self.fusion2 = FusionBlock(fusion_dim)
 
         # stage3 (16x)
-        self.fc3 = nn.SequentialCell(collections.OrderedDict([("0", nn.Dense(dim * 2, dim)), ("1", nn.GELU())]))
+        self.fc3 = nn.SequentialCell(collections.OrderedDict([("0", nn.Dense(dim * 2, dim)), ("1", GELU())]))
         self.conv3 = nn.SequentialCell(
             collections.OrderedDict(
                 [
@@ -282,7 +281,7 @@ class MiDaS(nn.Cell):
         self.fusion3 = FusionBlock(fusion_dim)
 
         # stage4 (32x)
-        self.fc4 = nn.SequentialCell(collections.OrderedDict([("0", nn.Dense(dim * 2, dim)), ("1", nn.GELU())]))
+        self.fc4 = nn.SequentialCell(collections.OrderedDict([("0", nn.Dense(dim * 2, dim)), ("1", GELU())]))
         self.conv4 = nn.SequentialCell(
             collections.OrderedDict(
                 [
@@ -318,8 +317,9 @@ class MiDaS(nn.Cell):
         )
 
     def construct(self, x):
-        b, _, h, w, p = *x.shape, self.patch_size
-        assert h % p == 0 and w % p == 0, f"Image size ({w}, {h}) is not divisible by patch size ({p}, {p})"
+        b, _, h, w = x.shape
+        p = self.patch_size
+        # assert h % p == 0 and w % p == 0, f"Image size ({w}, {h}) is not divisible by patch size ({p}, {p})"
         hp, wp, grid = h // p, w // p, self.image_size // p
 
         # embeddings
@@ -343,25 +343,25 @@ class MiDaS(nn.Cell):
         x = x + pos_embedding
 
         # stage1
-        x = self.blocks[self.slices[0]](x)
+        x = self.blocks[0](x)
         x1 = ops.concat([x[:, 1:], x[:, :1].expand_as(x[:, 1:])], axis=-1)
         x1 = nn.Unflatten(2, (hp, wp))(self.fc1(x1).permute(0, 2, 1))
         x1 = self.conv1(x1)
 
         # stage2
-        x = self.blocks[self.slices[1]](x)
+        x = self.blocks[1](x)
         x2 = ops.concat([x[:, 1:], x[:, :1].expand_as(x[:, 1:])], axis=-1)
         x2 = nn.Unflatten(2, (hp, wp))(self.fc2(x2).permute(0, 2, 1))
         x2 = self.conv2(x2)
 
         # stage3
-        x = self.blocks[self.slices[2]](x)
+        x = self.blocks[2](x)
         x3 = ops.concat([x[:, 1:], x[:, :1].expand_as(x[:, 1:])], axis=-1)
         x3 = nn.Unflatten(2, (hp, wp))(self.fc3(x3).permute(0, 2, 1))
         x3 = self.conv3(x3)
 
         # stage4
-        x = self.blocks[self.slices[3]](x)
+        x = self.blocks[3](x)
         x4 = ops.concat([x[:, 1:], x[:, :1].expand_as(x[:, 1:])], axis=-1)
         x4 = nn.Unflatten(2, (hp, wp))(self.fc4(x4).permute(0, 2, 1))
         x4 = self.conv4(x4)

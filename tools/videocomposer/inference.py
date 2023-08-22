@@ -194,7 +194,7 @@ class FrozenOpenCLIPEmbedder(nn.Cell):
         return
 
     def process_text(self, text_prompt):
-        return ms.Tensor(self.tokenizer(text_prompt, padding="max_length", max_length=77)["input_ids"]).reshape(1, -1)
+        return ms.Tensor(self.tokenizer(text_prompt, padding="max_length", max_length=77)["input_ids"])
 
     def construct(self, text):
         if isinstance(text, str):
@@ -227,7 +227,6 @@ class FrozenOpenCLIPEmbedder(nn.Cell):
         text_ = text_.transpose(1, 0, 2)
         text_ = self.model.ln_final(text_)
 
-        text_ = ops.matmul(text_[ms.numpy.arange(text_.shape[0]), text.argmax(-1)], self.model.text_projection)
         return text_
 
 
