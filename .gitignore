@@ -173,4 +173,5 @@ output/
 outputs/
 
 # weights
-model_weights/
+model_weights/*
+!model_weights/readme.md

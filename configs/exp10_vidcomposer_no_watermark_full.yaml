@@ -12,7 +12,7 @@ vit_image_size: 224
 network_name: UNetSD_temporal
 resume: true
 resume_step: 141000
-seed: 14 
+seed: 14
 num_workers: 1
 mvs_visual: True
 chunk_size: 1

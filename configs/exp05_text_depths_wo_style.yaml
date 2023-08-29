@@ -24,4 +24,3 @@ chunk_size: 1
 resume_checkpoint: "non_ema_228000.pth"
 log_dir: 'outputs'
 num_steps: 1
-

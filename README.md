@@ -6,7 +6,7 @@ Please see [Project Page](https://videocomposer.github.io/) for more examples.
 
 We are searching for talented, motivated, and imaginative researchers to join our team. If you are interested, please don't hesitate to send us your resume via email yingya.zyy@alibaba-inc.com
 
-![figure1](source/fig01.jpg "figure1")
+![figure1](assets/fig01.jpg "figure1")
 
 
 VideoComposer is a controllable video diffusion model, which allows users to flexibly control the spatial and temporal patterns simultaneously within a synthesized video in various forms, such as text description, sketch sequence, reference video, or even simply handcrafted motions and handrawings.
@@ -22,12 +22,12 @@ VideoComposer is a controllable video diffusion model, which allows users to fle
 
 ## Method
 
-![method](source/fig02_framwork.jpg "method")
+![method](assets/fig02_framwork.jpg "method")
 
 
 ## Running by Yourself
 
-### 1. Installation 
+### 1. Installation
 
 Requirements:
 - Python==3.8
@@ -36,7 +36,7 @@ Requirements:
 - torchvision==0.13.0+cu113
 - open-clip-torch==2.0.2
 - transformers==4.18.0
-- flash-attn==0.2 
+- flash-attn==0.2
 - xformers==0.0.13
 - motion-vector-extractor==1.0.6 (for motion vector extraction)
 
@@ -61,16 +61,16 @@ Next, place these models in the `model_weights` folder following the file struct
 ```
 |--model_weights/
 |    |--non_ema_228000.pth
-|    |--midas_v3_dpt_large.pth 
+|    |--midas_v3_dpt_large.pth
 |    |--open_clip_pytorch_model.bin
 |    |--sketch_simplification_gan.pth
 |    |--table5_pidinet.pth
 |    |--v2-1_512-ema-pruned.ckpt
 ```
 
-You can also download the some of them from their original project: 
+You can also download the some of them from their original project:
 - "midas_v3_dpt_large.pth" in [MiDaS](https://github.com/isl-org/MiDaS)
-- "open_clip_pytorch_model.bin" in [Open Clip](https://github.com/mlfoundations/open_clip) 
+- "open_clip_pytorch_model.bin" in [Open Clip](https://github.com/mlfoundations/open_clip)
 - "sketch_simplification_gan.pth" and "table5_pidinet.pth" in [Pidinet](https://github.com/zhuoinoulu/pidinet)
 - "v2-1_512-ema-pruned.ckpt" in [Stable Diffusion](https://huggingface.co/stabilityai/stable-diffusion-2-1-base/blob/main/v2-1_512-ema-pruned.ckpt).
 
@@ -96,8 +96,8 @@ python run_net.py\
 ```
 The results are saved in the `outputs/exp02_motion_transfer-S09999` folder:
 
-![case1](source/results/exp02_motion_transfer-S00009.gif "case2")
-![case2](source/results/exp02_motion_transfer-S09999.gif "case2")
+![case1](assets/results/exp02_motion_transfer-S00009.gif "case2")
+![case2](assets/results/exp02_motion_transfer-S09999.gif "case2")
 
 
 In some cases, if you notice a significant change in color difference, you can use the style condition to adjust the color distribution with the following command. This can be helpful in certain cases.
@@ -122,7 +122,7 @@ python run_net.py\
     --style_image "demo_video/style/qibaishi_01.png"\
     --input_text_desc "Red-backed Shrike lanius collurio"
 ```
-![case2](source/results/exp03_sketch2video_style-S09999.gif "case2")
+![case2](assets/results/exp03_sketch2video_style-S09999.gif "case2")
 
 
 
@@ -133,8 +133,8 @@ python run_net.py\
     --sketch_path "demo_video/src_single_sketch.png"\
     --input_text_desc "A Red-backed Shrike lanius collurio is on the branch"
 ```
-![case2](source/results/exp04_sketch2video_wo_style-S00144.gif "case2")
-![case2](source/results/exp04_sketch2video_wo_style-S00144-1.gif "case2")
+![case2](assets/results/exp04_sketch2video_wo_style-S00144.gif "case2")
+![case2](assets/results/exp04_sketch2video_wo_style-S00144-1.gif "case2")
 
 
 
@@ -145,8 +145,8 @@ python run_net.py\
     --input_video demo_video/video_8800.mp4\
     --input_text_desc "A glittering and translucent fish swimming in a small glass bowl with multicolored piece of stone, like a glass fish"
 ```
-![case2](source/results/exp05_text_depths_wo_style-S09999-0.gif "case2")
-![case2](source/results/exp05_text_depths_wo_style-S09999-2.gif "case2")
+![case2](assets/results/exp05_text_depths_wo_style-S09999-0.gif "case2")
+![case2](assets/results/exp05_text_depths_wo_style-S09999-2.gif "case2")
 
 ```
 python run_net.py\
@@ -157,8 +157,8 @@ python run_net.py\
     --input_text_desc "A glittering and translucent fish swimming in a small glass bowl with multicolored piece of stone, like a glass fish"
 ```
 
-![case2](source/results/exp06_text_depths_vs_style-S09999-0.gif "case2")
-![case2](source/results/exp06_text_depths_vs_style-S09999-1.gif "case2")
+![case2](assets/results/exp06_text_depths_vs_style-S09999-0.gif "case2")
+![case2](assets/results/exp06_text_depths_vs_style-S09999-1.gif "case2")
 
 
 #### 3.2 Inference on a Video
@@ -172,13 +172,13 @@ python run_net.py \
     --seed 9999
 ```
 
-This command will extract the different conditions, e.g., depth, sketch, motion vectors, of the input video for the following video generation, which are saved in the `outputs` folder. The task list are predefined in <font style="color: rgb(128,128,255)">inference_multi.py</font>. 
+This command will extract the different conditions, e.g., depth, sketch, motion vectors, of the input video for the following video generation, which are saved in the `outputs` folder. The task list are predefined in <font style="color: rgb(128,128,255)">inference_multi.py</font>.
 
 
 
-In addition to the above use cases, you can explore further possibilities with this code and model. Please note that due to the diversity of generated samples by the diffusion model, you can explore different seeds to generate better results. 
+In addition to the above use cases, you can explore further possibilities with this code and model. Please note that due to the diversity of generated samples by the diffusion model, you can explore different seeds to generate better results.
 
-We hope you enjoy using it! &#x1F600; 
+We hope you enjoy using it! &#x1F600;
 
 
 
