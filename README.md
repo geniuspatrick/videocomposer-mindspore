@@ -1,3 +1,88 @@
+# VideoComposer based on MindSpore
+
+This is an **unofficial** implementation of VideoComposer based on mindspore.
+
+## Progress
+
+### What's done
+
+- [x] exp01: inference different conditions from a video
+    - [x] image_depth
+    - [x] depth
+    - [x] local_image
+    - [x] masked
+    - [x] motion
+    - [x] sketch
+- [x] exp02: motion transfer from a video to a single image
+- [x] exp03: single sketch to videos with style
+- [x] exp04: single sketch to videos without style
+- [x] exp05: depth to video without style
+- [x] exp06: depth to video with style
+
+### TODOs
+
+- Training
+- Speed Up
+- Graph Mode
+- AMP
+
+### Limits
+
+Only runs in PyNative mode.
+
+## Setup Environment
+
+1. Create virtual environment
+    ```shell
+    conda create -n ms2.0 python=3.9
+    conda activate ms2.0
+    ```
+
+2. Install requirements
+    ```shell
+    pip install -r requirements.txt
+    ```
+
+## Prepare Model Weights
+
+### Download
+
+The root path of downloading must be `${PROJECT_ROOT}\model_weights`, where `${PROJECT_ROOT}` means the root path of project.
+Download from [official website](https://www.modelscope.cn/models/damo/VideoComposer/summary)
+and place them as:
+
+```
+|--model_weights
+|    |--non_ema_228000.pth
+|    |--midas_v3_dpt_large.pth
+|    |--open_clip_pytorch_model.bin (todo)
+|    |--sketch_simplification_gan.pth
+|    |--table5_pidinet.pth
+|    |--v2-1_512-ema-pruned.ckpt
+```
+
+### Convert
+
+In another virtual environment with `torch`, run the following script：
+
+```shell
+python vc/utils/pt2ms.py
+```
+
+You'll get the converted weights file in the same path, with the same name, ending with `npy`.
+
+## Demos
+
+```shell
+bash run_net.sh
+```
+
+---
+
+**The following content is the readme of the original repository.**
+
+---
+
 # VideoComposer
 
 Official repo for [VideoComposer: Compositional Video Synthesis with Motion Controllability](https://arxiv.org/pdf/2306.02018.pdf)
